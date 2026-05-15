@@ -74,6 +74,7 @@
 // <FS:Ansariel> [FS communication UI]
 //#include "llfloaterimnearbychat.h"
 #include "fsfloaternearbychat.h"
+#include "fsexternalfloaterhost.h"
 // </FS:Ansariel> [FS communication UI]
 #include "llmarketplacefunctions.h"
 #include "llnotifications.h"
@@ -2533,6 +2534,21 @@ void process_improved_im(LLMessageSystem *msg, void **user_data)
     binary_bucket_size = msg->getSizeFast(_PREHASH_MessageBlock, _PREHASH_BinaryBucket);
     EInstantMessage dialog = (EInstantMessage)d;
     LLHost sender = msg->getSender();
+
+#if LL_WINDOWS
+    if (dialog != IM_TYPING_START && dialog != IM_TYPING_STOP)
+    {
+        FSExternalFloaterHost::instance().traceLine(llformat(
+            "process_improved_im dialog=%d offline=%d from=%s to=%s session=%s name=%s text=%s",
+            static_cast<int>(dialog),
+            static_cast<int>(offline),
+            from_id.asString().c_str(),
+            to_id.asString().c_str(),
+            session_id.asString().c_str(),
+            agentName.c_str(),
+            message.substr(0, 120).c_str()));
+    }
+#endif
 
     LLSD metadata;
     if (msg->getNumberOfBlocksFast(_PREHASH_MetaData) > 0)

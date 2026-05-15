@@ -28,6 +28,7 @@
 
 #include "llimview.h"
 
+#include "fsexternalfloaterhost.h"
 #include "llavatarnamecache.h"  // IDEVO
 #include "llavataractions.h"
 #include "llfloaterconversationlog.h"
@@ -2187,6 +2188,15 @@ void deliverMessage(const std::string& utf8_text,
                      const LLUUID& other_participant_id,
                      EInstantMessage dialog)
 {
+#if LL_WINDOWS
+    FSExternalFloaterHost::instance().traceLine(llformat(
+        "deliverMessage session=%s other=%s dialog=%d text=%s",
+        im_session_id.asString().c_str(),
+        other_participant_id.asString().c_str(),
+        static_cast<int>(dialog),
+        utf8_text.substr(0, 120).c_str()));
+#endif
+
     std::string name;
     bool sent = false;
     LLAgentUI::buildFullname(name);
@@ -2265,6 +2275,15 @@ void LLIMModel::sendMessage(const std::string& utf8_text,
                      const LLUUID& other_participant_id,
                      EInstantMessage dialog)
 {
+#if LL_WINDOWS
+    FSExternalFloaterHost::instance().traceLine(llformat(
+        "LLIMModel::sendMessage session=%s other=%s dialog=%d text=%s",
+        im_session_id.asString().c_str(),
+        other_participant_id.asString().c_str(),
+        static_cast<int>(dialog),
+        utf8_text.substr(0, 120).c_str()));
+#endif
+
     //<FS:TS> FIRE-787: break up too long chat lines into multiple messages
     size_t split = MAX_MSG_BUF_SIZE - 1;
     size_t pos = 0;
@@ -3486,6 +3505,17 @@ void LLIMMgr::addMessage(
     bool is_announcement, // <FS:Ansariel> Special parameter indicating announcements
     bool keyword_alert_performed) // <FS:Ansariel> Pass info if keyword alert has been performed
 {
+#if LL_WINDOWS
+    FSExternalFloaterHost::instance().traceLine(llformat(
+        "LLIMMgr::addMessage raw session=%s target=%s dialog=%d from=%s offline=%d text=%s",
+        session_id.asString().c_str(),
+        target_id.asString().c_str(),
+        static_cast<int>(dialog),
+        from.c_str(),
+        static_cast<int>(is_offline_msg),
+        original_msg.substr(0, 120).c_str()));
+#endif
+
     // <FS:Zi> Omnifilter support
     std::string msg = original_msg;
 
@@ -4944,6 +4974,9 @@ public:
                       const LLSD& context,
                       const LLSD& input) const
     {
+#if LL_WINDOWS
+        FSExternalFloaterHost::instance().traceLine("ChatterBoxSessionEventReply input=" + input.asString().substr(0, 240));
+#endif
         LLUUID session_id;
         bool success;
 
@@ -5000,6 +5033,9 @@ public:
         const LLSD& context,
         const LLSD& input) const
     {
+#if LL_WINDOWS
+        FSExternalFloaterHost::instance().traceLine("ChatterBoxSessionUpdate input=" + input.asString().substr(0, 240));
+#endif
         LLUUID session_id = input["body"]["session_id"].asUUID();
         // <FS:Ansariel> Method does nothing
         //// <FS:Ansariel> [FS communication UI]
@@ -5042,6 +5078,9 @@ public:
         const LLSD& context,
         const LLSD& input) const
     {
+#if LL_WINDOWS
+        FSExternalFloaterHost::instance().traceLine("ChatterBoxInvitation input=" + input.asString().substr(0, 240));
+#endif
         //for backwards compatiblity reasons...we need to still
         //check for 'text' or 'voice' invitations...bleh
         if ( input["body"].has("instantmessage") )
@@ -5060,6 +5099,15 @@ public:
             LLUUID session_id = message_params["id"].asUUID();
             std::vector<U8> bin_bucket = message_params["data"]["binary_bucket"].asBinary();
             U8 offline = (U8)message_params["offline"].asInteger();
+
+#if LL_WINDOWS
+            FSExternalFloaterHost::instance().traceLine(llformat(
+                "ChatterBoxInvitation instantmessage from=%s session=%s offline=%d text=%s",
+                from_id.asString().c_str(),
+                session_id.asString().c_str(),
+                static_cast<int>(offline),
+                message.substr(0, 120).c_str()));
+#endif
 
             time_t timestamp =
                 (time_t) message_params["timestamp"].asInteger();
@@ -5248,4 +5296,3 @@ LLHTTPRegistration<LLViewerChatterBoxSessionUpdate>
 LLHTTPRegistration<LLViewerChatterBoxInvitation>
     gHTTPRegistrationMessageChatterBoxInvitation(
         "/message/ChatterBoxInvitation");
-

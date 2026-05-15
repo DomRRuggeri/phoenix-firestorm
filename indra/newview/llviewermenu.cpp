@@ -164,6 +164,7 @@
 #include "fsfloateravataralign.h" // <FS:Chanayane> Compass floater
 #include "fsassetblacklist.h"
 #include "fsdata.h"
+#include "fsexternalfloaterhost.h"
 #include "fslslbridge.h"
 #include "fscommon.h"
 #include "fsfloaterexport.h"
@@ -8610,6 +8611,36 @@ void handle_hover_height()
     LLFloaterReg::showInstance("edit_hover_height");
 }
 
+void handle_external_conversations()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::CONVERSATIONS);
+}
+
+void handle_external_communications()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::COMMUNICATIONS);
+}
+
+void handle_external_people()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::PEOPLE);
+}
+
+void handle_external_nearby_chat()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::NEARBY_CHAT);
+}
+
+void handle_external_world_map()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::WORLD_MAP);
+}
+
+void handle_external_inventory()
+{
+    FSExternalFloaterHost::instance().show(FSExternalFloaterHost::Target::INVENTORY);
+}
+
 void handle_edit_physics()
 {
     LLFloaterSidePanelContainer::showPanel("appearance", LLSD().with("type", "edit_physics"));
@@ -12726,6 +12757,12 @@ void initialize_menus()
     commit.add("EditShape", boost::bind(&handle_edit_shape));
     commit.add("Omnifilter", boost::bind(&handle_omnifilter));      // <FS:Zi> Omnifilter support
     commit.add("HoverHeight", boost::bind(&handle_hover_height));
+    commit.add("ExternalFloaters.Communications", boost::bind(&handle_external_communications));
+    commit.add("ExternalFloaters.Conversations", boost::bind(&handle_external_conversations));
+    commit.add("ExternalFloaters.People", boost::bind(&handle_external_people));
+    commit.add("ExternalFloaters.NearbyChat", boost::bind(&handle_external_nearby_chat));
+    commit.add("ExternalFloaters.WorldMap", boost::bind(&handle_external_world_map));
+    commit.add("ExternalFloaters.Inventory", boost::bind(&handle_external_inventory));
     commit.add("EditPhysics", boost::bind(&handle_edit_physics));
     // <FS:TT> Client LSL Bridge
     commit.add("RecreateLSLBridge", boost::bind(&handle_recreate_lsl_bridge));

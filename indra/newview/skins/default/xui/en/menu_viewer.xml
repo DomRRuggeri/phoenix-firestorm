@@ -61,6 +61,12 @@
            parameter="inventory" />
         </menu_item_check>
         <menu_item_call
+         label="Inventory (BExternal)"
+         name="Inventory BExternal">
+          <menu_item_call.on_click
+           function="ExternalFloaters.Inventory" />
+        </menu_item_call>
+        <menu_item_call
          label="New Inventory Window"
          name="NewInventoryWindow"
          shortcut="control|shift|I"
@@ -879,6 +885,12 @@
              function="Floater.Toggle"
              parameter="people" />
             </menu_item_check>
+        <menu_item_call
+         label="People (BExternal)"
+         name="People BExternal">
+            <menu_item_call.on_click
+             function="ExternalFloaters.People" />
+        </menu_item_call>
         <menu_item_check
          label="Conversations"
          name="Conversations"
@@ -891,6 +903,24 @@
              function="Floater.ToggleOrBringToFront"
              parameter="fs_im_container" />
         </menu_item_check>
+        <menu_item_call
+         label="Communications (BExternal)"
+         name="Communications BExternal">
+            <menu_item_call.on_click
+             function="ExternalFloaters.Communications" />
+        </menu_item_call>
+        <menu_item_call
+         label="Conversations (BExternal)"
+         name="Conversations BExternal">
+            <menu_item_call.on_click
+             function="ExternalFloaters.Conversations" />
+        </menu_item_call>
+        <menu_item_call
+         label="Nearby Chat (BExternal)"
+         name="Nearby Chat BExternal">
+            <menu_item_call.on_click
+             function="ExternalFloaters.NearbyChat" />
+        </menu_item_call>
 
         <menu_item_check
           label="Omnifilter"
@@ -1117,6 +1147,12 @@
              function="Floater.Toggle"
              parameter="world_map" />
         </menu_item_check>
+        <menu_item_call
+             label="World Map (BExternal)"
+             name="World Map BExternal">
+            <menu_item_call.on_click
+             function="ExternalFloaters.WorldMap" />
+        </menu_item_call>
         
          <menu_item_check
              label="Region Tracker"

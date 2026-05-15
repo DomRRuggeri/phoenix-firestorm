@@ -38,6 +38,7 @@
 #include "fscommon.h"
 #include "fsfloaterim.h"
 #include "fsfloaterimcontainer.h"
+#include "fsexternalfloaterhost.h"
 #include "fsnearbychathub.h"
 #include "llagent.h"            // gAgent
 #include "llagentcamera.h"  // gAgentCamera
@@ -311,6 +312,27 @@ void FSFloaterNearbyChat::addMessage(const LLChat& chat,bool archive,const LLSD 
             mMessageArchive.erase(mMessageArchive.begin());
         }
     }
+
+#if LL_WINDOWS
+    const bool is_external_nearby_chat =
+        chat.mChatType == CHAT_TYPE_WHISPER ||
+        chat.mChatType == CHAT_TYPE_NORMAL ||
+        chat.mChatType == CHAT_TYPE_SHOUT ||
+        chat.mChatType == CHAT_TYPE_OOC ||
+        chat.mChatType == CHAT_TYPE_OWNER ||
+        chat.mChatType == CHAT_TYPE_DIRECT ||
+        chat.mChatType == CHAT_TYPE_RADAR ||
+        chat.mChatType == CHAT_TYPE_REGION ||
+        chat.mChatType == CHAT_TYPE_DEBUG_MSG;
+    if (!chat.mMuted && is_external_nearby_chat)
+    {
+        FSExternalFloaterHost::instance().queueNearbyChatMessage(
+            tmp_chat.mFromName,
+            tmp_chat.mTimeStr,
+            tmp_chat.mText,
+            chat.mChatType);
+    }
+#endif
 
     if (args["do_not_log"].asBoolean() || chat.mMuted)
     {

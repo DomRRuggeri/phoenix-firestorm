@@ -35,6 +35,7 @@
 #include "fschatoptionsmenu.h"
 #include "fscommon.h"
 #include "fsdata.h"
+#include "fsexternalfloaterhost.h"
 #include "fsfloaterimcontainer.h" // to replace separate IM Floaters with multifloater container
 #include "fsfloaternearbychat.h"
 #include "fsnearbychathub.h"    // <FS:Zi> FIRE-24133 - Redirect chat channel messages
@@ -568,6 +569,16 @@ void FSFloaterIM::sendMsg(const std::string& msg)
     //std::string utf8_text = utf8str_truncate(msg, MAX_MSG_BUF_SIZE - 1);
     std::string utf8_text = msg;
     // </FS:CR>
+
+#if LL_WINDOWS
+    FSExternalFloaterHost::instance().traceLine(llformat(
+        "FSFloaterIM::sendMsg session=%s other=%s dialog=%d initialized=%d text=%s",
+        mSessionID.asString().c_str(),
+        mOtherParticipantUUID.asString().c_str(),
+        static_cast<int>(mDialog),
+        static_cast<int>(mSessionInitialized),
+        utf8_text.substr(0, 120).c_str()));
+#endif
 
     if ( (RlvActions::hasBehaviour(RLV_BHVR_SENDIM)) || (RlvActions::hasBehaviour(RLV_BHVR_SENDIMTO)) )
     {

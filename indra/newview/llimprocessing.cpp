@@ -33,6 +33,7 @@
 #include "llavatarnamecache.h"
 #include "llfirstuse.h"
 #include "llfloaterreg.h"
+#include "fsexternalfloaterhost.h"
 // <FS:Ansariel> [FS communication UI]
 //#include "llfloaterimnearbychat.h"
 #include "fsfloaternearbychat.h"
@@ -721,6 +722,21 @@ void LLIMProcessing::processNewMessage(LLUUID from_id,
     LLChat chat;
     std::string buffer;
     std::string name = agentName;
+
+#if LL_WINDOWS
+    if (dialog != IM_TYPING_START && dialog != IM_TYPING_STOP)
+    {
+        const std::string fs_external_packet_debug = llformat(
+            "Incoming IM packet dialog=%d offline=%d from=%s session=%s text=%s",
+            static_cast<int>(dialog),
+            static_cast<int>(offline),
+            from_id.asString().c_str(),
+            session_id.asString().c_str(),
+            message.substr(0, 80).c_str());
+        LL_WARNS("FSExternal") << fs_external_packet_debug << LL_ENDL;
+        FSExternalFloaterHost::instance().traceLine("LLIMProcessing::processNewMessage " + fs_external_packet_debug);
+    }
+#endif
 
     // NaCl - Antispam Registry
     if (dialog != IM_TYPING_START && dialog != IM_TYPING_STOP &&                                            // Typing notifications
@@ -2605,4 +2621,3 @@ void LLIMProcessing::requestOfflineMessagesLegacy()
     msg->addUUIDFast(_PREHASH_SessionID, gAgent.getSessionID());
     gAgent.sendReliableMessage();
 }
-

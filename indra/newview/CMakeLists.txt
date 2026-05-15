@@ -304,6 +304,7 @@ set(viewer_SOURCE_FILES
     llexpandabletextbox.cpp
     llexperiencelog.cpp
     llexternaleditor.cpp
+    fsexternalfloaterhost.cpp
     llface.cpp
     llfasttimerview.cpp
     llfavoritesbar.cpp
@@ -1169,6 +1170,7 @@ set(viewer_HEADER_FILES
     llexpandabletextbox.h
     llexperiencelog.h
     llexternaleditor.h
+    fsexternalfloaterhost.h
     llface.h
     llfasttimerview.h
     llfavoritesbar.h
@@ -2288,6 +2290,15 @@ add_executable(${VIEWER_BINARY_NAME}
     MACOSX_BUNDLE
     ${viewer_SOURCE_FILES}
     )
+
+if (WINDOWS)
+    add_executable(firestorm-external
+        WIN32
+        fsexternalcompanion.cpp
+        fsexternalcompanion.rc
+        )
+    target_link_libraries(firestorm-external shell32)
+endif (WINDOWS)
 
 # add package files
 file(GLOB EVENT_HOST_SCRIPT_GLOB_LIST
