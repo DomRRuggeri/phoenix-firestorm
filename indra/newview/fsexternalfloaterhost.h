@@ -57,6 +57,7 @@ public:
                                 const std::string& time,
                                 const std::string& message,
                                 S32 chat_type);
+    void queueTypingState(const LLUUID& session_id, const LLUUID& from_id, bool typing);
 #endif
 
 private:

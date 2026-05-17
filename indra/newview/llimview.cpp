@@ -4860,6 +4860,10 @@ void LLIMMgr::processIMTypingCore(const LLUUID& from_id, const EInstantMessage i
 {
     LLUUID session_id = computeSessionID(im_type, from_id);
 
+#if LL_WINDOWS
+    FSExternalFloaterHost::instance().queueTypingState(session_id, from_id, typing);
+#endif
+
     // <FS:Ansariel> Announce incoming IMs
     static LLCachedControl<bool> announceIncomingIM(gSavedSettings, "FSAnnounceIncomingIM");
     if (typing && !gIMMgr->hasSession(session_id) && announceIncomingIM)

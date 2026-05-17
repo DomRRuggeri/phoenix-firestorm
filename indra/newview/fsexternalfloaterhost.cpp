@@ -8,6 +8,7 @@
 #include "fsexternalfloaterhost.h"
 
 #include "llagent.h"
+#include "llavataractions.h"
 #include "llavatarname.h"
 #include "llavatarnamecache.h"
 #include "lldate.h"
@@ -205,6 +206,11 @@ namespace
         line += sanitize_pipe_field(message["time"].asString());
         line += "|";
         line += sanitize_pipe_field(message["message"].asString());
+        if (message.has("index"))
+        {
+            line += "|";
+            line += std::to_string(message["index"].asInteger());
+        }
         return line;
     }
 
@@ -650,6 +656,7 @@ void FSExternalFloaterHost::sendInitialConversationSnapshot(HANDLE pipe)
         write_pipe_line(pipe, "DEBUG|Snapshot requested from Firestorm conversation model");
 
         S32 session_count = 0;
+        S32 message_count = 0;
         for (const auto& entry : LLIMModel::instance().mId2SessionMap)
         {
             const LLIMModel::LLIMSession* session = entry.second;
@@ -673,6 +680,12 @@ void FSExternalFloaterHost::sendInitialConversationSnapshot(HANDLE pipe)
                 {
                     max_message_index = std::max(max_message_index, message["index"].asInteger());
                 }
+                const bool is_history = message.has("is_history") && message["is_history"].asInteger() != 0;
+                if (!is_history)
+                {
+                    write_pipe_line(pipe, build_message_line(session->mSessionID, message));
+                    ++message_count;
+                }
             }
 
             {
@@ -683,10 +696,11 @@ void FSExternalFloaterHost::sendInitialConversationSnapshot(HANDLE pipe)
             }
         }
 
-        write_pipe_line(pipe, llformat("SNAPSHOT_DONE|%d|%d", session_count, 0));
-        traceLine(llformat("sendInitialConversationSnapshot done sessions=%d messages=0", session_count));
+        write_pipe_line(pipe, llformat("SNAPSHOT_DONE|%d|%d", session_count, message_count));
+        traceLine(llformat("sendInitialConversationSnapshot done sessions=%d messages=%d", session_count, message_count));
         LL_INFOS("FSExternal") << "Sent external conversation snapshot: sessions="
-                               << session_count << ", messages=0" << LL_ENDL;
+                               << session_count << ", messages="
+                               << message_count << LL_ENDL;
     });
 }
 
@@ -806,6 +820,19 @@ void FSExternalFloaterHost::handlePipeCommand(const std::string& line)
         return;
     }
 
+    if (parts.size() >= 2 && parts[0] == "ZOOM_AVATAR")
+    {
+        const LLUUID avatar_id(parts[1]);
+        if (avatar_id.notNull() && avatar_id != gAgent.getID())
+        {
+            LLMainThreadTask::dispatch([avatar_id]()
+            {
+                LLAvatarActions::zoomIn(avatar_id);
+            });
+        }
+        return;
+    }
+
     if (parts.size() < 5 || parts[0] != "SEND")
     {
         return;
@@ -843,6 +870,24 @@ void FSExternalFloaterHost::queueNearbyChatMessage(const std::string& from,
     line += sanitize_pipe_field(message);
     line += "|";
     line += std::to_string(chat_type);
+    queueBroadcastLine(line);
+}
+
+void FSExternalFloaterHost::queueTypingState(const LLUUID& session_id, const LLUUID& from_id, bool typing)
+{
+    if (session_id.isNull() || from_id.isNull())
+    {
+        return;
+    }
+
+    ensureIpcServer();
+
+    std::string line = "TYPING|";
+    line += session_id.asString();
+    line += "|";
+    line += from_id.asString();
+    line += "|";
+    line += typing ? "1" : "0";
     queueBroadcastLine(line);
 }
 

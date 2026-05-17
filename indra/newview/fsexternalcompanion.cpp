@@ -41,6 +41,7 @@ namespace
     struct DisplayMessage
     {
         std::wstring mText;
+        std::wstring mKey;
         bool mHistory = false;
     };
 
@@ -72,6 +73,8 @@ namespace
         int mPeopleSortColumn[3] = { 1, 0, 0 };
         bool mPeopleSortAscending[3] = { true, true, true };
         std::array<std::vector<std::wstring>, 3> mPeopleRows;
+        std::array<std::vector<std::wstring>, 3> mPeopleIds;
+        std::array<std::vector<std::wstring>, 3> mRenderedPeopleIds;
         std::map<std::wstring, std::wstring> mNearbyPeople;
         std::map<std::wstring, std::wstring> mPendingNearbyPeople;
         bool mNearbyPeopleInitialized = false;
@@ -89,9 +92,12 @@ namespace
         std::set<std::wstring> mLocallyClosedSessionIds;
         bool mFriendsRefreshDeferred = false;
         std::map<std::wstring, std::vector<DisplayMessage>> mSessionMessages;
+        std::map<std::wstring, std::set<std::wstring>> mSessionMessageKeys;
         HANDLE mPipe = INVALID_HANDLE_VALUE;
         std::wstring mPipeName;
         bool mClosing = false;
+        bool mReconnectInProgress = false;
+        DWORD mLastPipeReadTick = 0;
         HFONT mFont = nullptr;
         HFONT mHeaderFont = nullptr;
         HBRUSH mBackgroundBrush = nullptr;
@@ -108,6 +114,8 @@ namespace
         std::wstring mName;
         std::wstring mOtherParticipantId;
         std::wstring mDialog;
+        bool mHasUnread = false;
+        bool mIsTyping = false;
     };
 
     constexpr int IDC_SESSIONS = 1001;
@@ -135,7 +143,9 @@ namespace
     constexpr UINT WM_PIPE_LINE = WM_APP + 1;
     constexpr UINT WM_PIPE_DISCONNECTED = WM_APP + 2;
     constexpr UINT WM_PIPE_RECONNECTED = WM_APP + 3;
+    constexpr UINT_PTR IDT_PIPE_HEARTBEAT = 3001;
     constexpr int CHAT_TYPE_RADAR = 12;
+    constexpr COLORREF NOTICE_TEXT_COLOR = RGB(139, 233, 253);
     constexpr DWORD LISTBOX_STYLE = WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS;
     constexpr DWORD LISTBOX_NOTIFY_STYLE = LISTBOX_STYLE | LBS_NOTIFY;
     constexpr DWORD LISTBOX_TABS_STYLE = LISTBOX_STYLE | LBS_USETABSTOPS;
@@ -419,6 +429,48 @@ namespace
         return parts;
     }
 
+    std::wstring make_message_key(const std::vector<std::string>& parts)
+    {
+        if (parts.size() >= 6 && !parts[5].empty())
+        {
+            std::wstring key = L"index:";
+            key += utf8_to_wide(parts[5]);
+            return key;
+        }
+
+        std::wstring key;
+        if (parts.size() >= 2)
+        {
+            key += utf8_to_wide(parts[1]);
+        }
+        key += L"|";
+        if (parts.size() >= 3)
+        {
+            key += utf8_to_wide(parts[2]);
+        }
+        key += L"|";
+        if (parts.size() >= 4)
+        {
+            key += utf8_to_wide(parts[3]);
+        }
+        key += L"|";
+        if (parts.size() >= 5)
+        {
+            key += utf8_to_wide(parts[4]);
+        }
+        return key;
+    }
+
+    bool remember_message_key(WindowState* state, const std::wstring& session_id, const std::wstring& key)
+    {
+        if (!state || session_id.empty() || key.empty())
+        {
+            return true;
+        }
+
+        return state->mSessionMessageKeys[session_id].insert(key).second;
+    }
+
     bool write_pipe_line(HANDLE pipe, const std::string& line)
     {
         std::string payload = line;
@@ -628,8 +680,8 @@ namespace
         SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
         if (is_rich_edit(edit))
         {
-            append_rich_segment(edit, line, RGB(139, 233, 253), true);
-            append_rich_segment(edit, L"\r\n", RGB(139, 233, 253), false);
+            append_rich_segment(edit, line, NOTICE_TEXT_COLOR, true);
+            append_rich_segment(edit, L"\r\n", NOTICE_TEXT_COLOR, false);
         }
         else
         {
@@ -823,20 +875,31 @@ namespace
 
         SendMessageW(state->mPeopleList, WM_SETREDRAW, FALSE, 0);
         SendMessageW(state->mPeopleList, LB_RESETCONTENT, 0, 0);
+        std::vector<std::pair<std::wstring, std::wstring>> people;
         auto& rows = state->mPeopleRows[state->mPeopleActiveTab];
+        auto& ids = state->mPeopleIds[state->mPeopleActiveTab];
+        people.reserve(rows.size());
+        for (size_t index = 0; index < rows.size(); ++index)
+        {
+            const std::wstring id = index < ids.size() ? ids[index] : L"";
+            people.emplace_back(rows[index], id);
+        }
+
         const int sort_column = state->mPeopleSortColumn[state->mPeopleActiveTab];
         const bool ascending = state->mPeopleSortAscending[state->mPeopleActiveTab];
-        std::stable_sort(rows.begin(), rows.end(), [sort_column, ascending](const std::wstring& left, const std::wstring& right)
+        std::stable_sort(people.begin(), people.end(), [sort_column, ascending](const auto& left, const auto& right)
         {
-            const int result = compare_table_rows(left, right, sort_column, true);
+            const int result = compare_table_rows(left.first, right.first, sort_column, true);
             return ascending ? result < 0 : result > 0;
         });
 
+        state->mRenderedPeopleIds[state->mPeopleActiveTab].clear();
         const wchar_t* people_headers[] = { L"Name", L"Distance", L"Time", L"Age" };
         append_listbox_line(state->mPeopleList, table_header_text(people_headers, 4, sort_column, ascending), false);
-        for (const std::wstring& row : state->mPeopleRows[state->mPeopleActiveTab])
+        for (const auto& row : people)
         {
-            append_listbox_line(state->mPeopleList, row, false);
+            append_listbox_line(state->mPeopleList, row.first, false);
+            state->mRenderedPeopleIds[state->mPeopleActiveTab].push_back(row.second);
         }
 
         restore_list_selection(state->mPeopleList, selected_text, top_index);
@@ -1078,6 +1141,52 @@ namespace
         return reinterpret_cast<SessionInfo*>(SendMessageW(state->mSessions, LB_GETITEMDATA, selected, 0));
     }
 
+    void set_session_unread(WindowState* state, const std::wstring& session_id, bool unread)
+    {
+        if (!state || !state->mSessions)
+        {
+            return;
+        }
+
+        const LRESULT count = SendMessageW(state->mSessions, LB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index)
+        {
+            auto session = reinterpret_cast<SessionInfo*>(SendMessageW(state->mSessions, LB_GETITEMDATA, index, 0));
+            if (session && session->mSessionId == session_id)
+            {
+                if (session->mHasUnread != unread)
+                {
+                    session->mHasUnread = unread;
+                    InvalidateRect(state->mSessions, nullptr, TRUE);
+                }
+                return;
+            }
+        }
+    }
+
+    void set_session_typing(WindowState* state, const std::wstring& session_id, bool typing)
+    {
+        if (!state || !state->mSessions)
+        {
+            return;
+        }
+
+        const LRESULT count = SendMessageW(state->mSessions, LB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index)
+        {
+            auto session = reinterpret_cast<SessionInfo*>(SendMessageW(state->mSessions, LB_GETITEMDATA, index, 0));
+            if (session && session->mSessionId == session_id)
+            {
+                if (session->mIsTyping != typing)
+                {
+                    session->mIsTyping = typing;
+                    InvalidateRect(state->mSessions, nullptr, TRUE);
+                }
+                return;
+            }
+        }
+    }
+
     void refresh_conversation_messages(WindowState* state)
     {
         if (!state || !state->mMessages)
@@ -1093,6 +1202,7 @@ namespace
             SetWindowTextW(state->mStatus, L"Ready. No conversation selected.");
             return;
         }
+        set_session_unread(state, session->mSessionId, false);
 
         const auto messages = state->mSessionMessages.find(session->mSessionId);
         if (messages != state->mSessionMessages.end())
@@ -1586,6 +1696,8 @@ namespace
             }
             const int tab = people_tab_index(parts[1]);
             state->mPeopleRows[tab].clear();
+            state->mPeopleIds[tab].clear();
+            state->mRenderedPeopleIds[tab].clear();
             if (tab == 0)
             {
                 state->mPendingNearbyPeople.clear();
@@ -1606,6 +1718,7 @@ namespace
             row += L"\t";
             row += utf8_to_wide(parts[6]);
             state->mPeopleRows[tab].push_back(row);
+            state->mPeopleIds[tab].push_back(utf8_to_wide(parts[2]));
             if (tab == 0)
             {
                 state->mPendingNearbyPeople[utf8_to_wide(parts[2])] = utf8_to_wide(parts[3]);
@@ -1758,6 +1871,14 @@ namespace
 
             const std::wstring session_id = utf8_to_wide(parts[1]);
             auto& messages = state->mSessionMessages[session_id];
+            auto& keys = state->mSessionMessageKeys[session_id];
+            for (const DisplayMessage& message : messages)
+            {
+                if (message.mHistory && !message.mKey.empty())
+                {
+                    keys.erase(message.mKey);
+                }
+            }
             messages.erase(
                 std::remove_if(
                     messages.begin(),
@@ -1777,12 +1898,18 @@ namespace
             display += L": ";
             display += utf8_to_wide(parts[4]);
 
+            const std::wstring key = make_message_key(parts);
+            if (!remember_message_key(state, session_id, key))
+            {
+                return;
+            }
+
             auto& messages = state->mSessionMessages[session_id];
             const auto first_live = std::find_if(
                 messages.begin(),
                 messages.end(),
                 [](const DisplayMessage& message) { return !message.mHistory; });
-            messages.insert(first_live, { display, true });
+            messages.insert(first_live, { display, key, true });
         }
         else if (parts[0] == "HISTORY_DONE" && parts.size() >= 2)
         {
@@ -1812,13 +1939,34 @@ namespace
             std::wstring display = utf8_to_wide(parts[2]);
             display += L": ";
             display += utf8_to_wide(parts[4]);
-            state->mSessionMessages[session_id].push_back({ display, false });
+            const std::wstring key = make_message_key(parts);
+            if (!remember_message_key(state, session_id, key))
+            {
+                trace_line("ignored duplicate MSG for session " + parts[1]);
+                return;
+            }
+
+            state->mSessionMessages[session_id].push_back({ display, key, false });
 
             SessionInfo* selected_session = get_selected_session(state);
             if (selected_session && selected_session->mSessionId == session_id)
             {
                 append_text_line(state->mMessages, display);
             }
+            else
+            {
+                set_session_unread(state, session_id, true);
+            }
+            set_session_typing(state, session_id, false);
+        }
+        else if (parts[0] == "TYPING" && parts.size() >= 4)
+        {
+            if (!is_conversations_target(state))
+            {
+                return;
+            }
+
+            set_session_typing(state, utf8_to_wide(parts[1]), parts[3] == "1");
         }
         else if (parts[0] == "DEBUG" && parts.size() >= 2)
         {
@@ -1989,6 +2137,21 @@ namespace
             delete pair;
             return 0;
         }, new std::pair<HWND, std::wstring>(hwnd, pipe_name), 0, nullptr);
+    }
+
+    void begin_pipe_reconnect(HWND hwnd, WindowState* state, const wchar_t* status)
+    {
+        if (!hwnd || !state || state->mClosing || state->mPipeName.empty() || state->mReconnectInProgress)
+        {
+            return;
+        }
+
+        state->mReconnectInProgress = true;
+        if (status)
+        {
+            SetWindowTextW(state->mStatus, status);
+        }
+        start_pipe_reconnect(hwnd, state->mPipeName);
     }
 
     void layout_controls(WindowState* state, int width, int height)
@@ -2243,6 +2406,31 @@ namespace
         }
     }
 
+    void zoom_selected_person(WindowState* state)
+    {
+        if (!state || !state->mPeopleList || state->mPipe == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        const LRESULT selected = SendMessageW(state->mPeopleList, LB_GETCURSEL, 0, 0);
+        if (selected == LB_ERR || selected <= 0)
+        {
+            return;
+        }
+
+        const size_t person_index = static_cast<size_t>(selected - 1);
+        const auto& ids = state->mRenderedPeopleIds[state->mPeopleActiveTab];
+        if (person_index >= ids.size() || ids[person_index].empty())
+        {
+            return;
+        }
+
+        std::string line = "ZOOM_AVATAR|";
+        line += wide_to_utf8(ids[person_index]);
+        async_write_pipe_line(state->mPipe, line);
+    }
+
     void close_selected_session(WindowState* state)
     {
         if (!state || !state->mSessions)
@@ -2265,6 +2453,7 @@ namespace
         const std::wstring session_id = session->mSessionId;
         state->mLocallyClosedSessionIds.insert(session_id);
         state->mSessionMessages.erase(session_id);
+        state->mSessionMessageKeys.erase(session_id);
         delete session;
         SendMessageW(state->mSessions, LB_DELETESTRING, selected, 0);
 
@@ -2524,8 +2713,16 @@ namespace
                     const bool selected = (draw->itemState & ODS_SELECTED) != 0;
                     const bool header = draw->itemID == 0 &&
                         (draw->CtlID == IDC_PEOPLE_LIST || draw->CtlID == IDC_FRIENDS_LIST);
+                    bool unread_session = false;
+                    bool typing_session = false;
+                    if (draw->CtlID == IDC_SESSIONS)
+                    {
+                        auto session = reinterpret_cast<SessionInfo*>(SendMessageW(draw->hwndItem, LB_GETITEMDATA, draw->itemID, 0));
+                        unread_session = session && session->mHasUnread;
+                        typing_session = session && session->mIsTyping;
+                    }
                     const COLORREF fill = selected ? theme.mSurface : theme.mField;
-                    const COLORREF text = header ? theme.mMutedText : theme.mText;
+                    const COLORREF text = header ? theme.mMutedText : unread_session ? theme.mAccent : typing_session ? NOTICE_TEXT_COLOR : theme.mText;
                     HBRUSH fill_brush = CreateSolidBrush(fill);
                     FillRect(draw->hDC, &draw->rcItem, fill_brush);
                     DeleteObject(fill_brush);
@@ -2773,6 +2970,11 @@ namespace
                     }
                     return 0;
                 }
+                if (LOWORD(wparam) == IDC_PEOPLE_LIST && HIWORD(wparam) == LBN_DBLCLK)
+                {
+                    zoom_selected_person(state);
+                    return 0;
+                }
                 if (LOWORD(wparam) == IDC_FRIENDS_LIST && HIWORD(wparam) == LBN_DBLCLK)
                 {
                     open_selected_friend_im(state);
@@ -2827,8 +3029,33 @@ namespace
                 auto line = reinterpret_cast<std::string*>(lparam);
                 if (line)
                 {
+                    auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+                    if (state)
+                    {
+                        state->mLastPipeReadTick = GetTickCount();
+                    }
                     handle_pipe_line(hwnd, *line);
                     delete line;
+                }
+                return 0;
+            }
+            case WM_TIMER:
+            {
+                auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+                if (state && wparam == IDT_PIPE_HEARTBEAT && !state->mClosing && !state->mPipeName.empty())
+                {
+                    const DWORD now = GetTickCount();
+                    const DWORD elapsed = now - state->mLastPipeReadTick;
+                    if (state->mPipe != INVALID_HANDLE_VALUE && elapsed > 5000)
+                    {
+                        trace_line("pipe heartbeat stale elapsed=" + std::to_string(elapsed));
+                        SetWindowTextW(state->mStatus, L"Reconnecting to Firestorm conversation bridge...");
+                        CancelIoEx(state->mPipe, nullptr);
+                    }
+                    else if (state->mPipe == INVALID_HANDLE_VALUE)
+                    {
+                        begin_pipe_reconnect(hwnd, state, L"Reconnecting to Firestorm conversation bridge...");
+                    }
                 }
                 return 0;
             }
@@ -2840,11 +3067,7 @@ namespace
                 {
                     CloseHandle(state->mPipe);
                     state->mPipe = INVALID_HANDLE_VALUE;
-                    SetWindowTextW(state->mStatus, L"Reconnecting to Firestorm conversation bridge...");
-                    if (!state->mPipeName.empty())
-                    {
-                        start_pipe_reconnect(hwnd, state->mPipeName);
-                    }
+                    begin_pipe_reconnect(hwnd, state, L"Reconnecting to Firestorm conversation bridge...");
                 }
                 else if (pipe != INVALID_HANDLE_VALUE)
                 {
@@ -2859,6 +3082,8 @@ namespace
                 if (state && !state->mClosing && state->mPipe == INVALID_HANDLE_VALUE)
                 {
                     state->mPipe = pipe;
+                    state->mReconnectInProgress = false;
+                    state->mLastPipeReadTick = GetTickCount();
                     SetWindowTextW(state->mStatus, L"Connected to Firestorm conversation bridge");
                     start_pipe_reader(hwnd, state->mPipe);
                 }
@@ -2878,6 +3103,7 @@ namespace
                 if (state)
                 {
                     state->mClosing = true;
+                    KillTimer(hwnd, IDT_PIPE_HEARTBEAT);
                     if (state->mSessions)
                     {
                         const LRESULT count = SendMessageW(state->mSessions, LB_GETCOUNT, 0, 0);
@@ -3062,16 +3288,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
     if (!pipe_name.empty())
     {
         state->mPipeName = pipe_name;
+        state->mLastPipeReadTick = GetTickCount();
+        SetTimer(hwnd, IDT_PIPE_HEARTBEAT, 5000, nullptr);
         SetWindowTextW(state->mStatus, L"Connecting to Firestorm conversation bridge...");
         state->mPipe = open_pipe_with_retry(pipe_name);
         if (state->mPipe != INVALID_HANDLE_VALUE)
         {
+            state->mReconnectInProgress = false;
+            state->mLastPipeReadTick = GetTickCount();
             SetWindowTextW(state->mStatus, L"Connected to Firestorm conversation bridge");
             start_pipe_reader(hwnd, state->mPipe);
         }
         else
         {
             SetWindowTextW(state->mStatus, L"Unable to connect to Firestorm conversation bridge");
+            begin_pipe_reconnect(hwnd, state, L"Reconnecting to Firestorm conversation bridge...");
         }
     }
 
