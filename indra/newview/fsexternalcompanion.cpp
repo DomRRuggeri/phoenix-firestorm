@@ -105,6 +105,9 @@ namespace
         HBRUSH mFieldBrush = nullptr;
         WNDPROC mMessagesProc = nullptr;
         WNDPROC mNearbyMessagesProc = nullptr;
+        WNDPROC mInputProc = nullptr;
+        WNDPROC mNearbyInputProc = nullptr;
+        WNDPROC mFriendsSearchProc = nullptr;
         AppTheme mTheme;
     };
 
@@ -140,6 +143,8 @@ namespace
     constexpr int IDM_THEME_SAVE = 2002;
     constexpr int IDM_THEME_LOAD = 2003;
     constexpr int IDM_SESSION_CLOSE = 2101;
+    constexpr int IDM_PERSON_IM = 2201;
+    constexpr int IDM_PERSON_ZOOM = 2202;
     constexpr UINT WM_PIPE_LINE = WM_APP + 1;
     constexpr UINT WM_PIPE_DISCONNECTED = WM_APP + 2;
     constexpr UINT WM_PIPE_RECONNECTED = WM_APP + 3;
@@ -725,6 +730,81 @@ namespace
         return original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
+    WNDPROC original_input_proc(WindowState* state, HWND hwnd)
+    {
+        if (!state)
+        {
+            return nullptr;
+        }
+        if (hwnd == state->mNearbyInput)
+        {
+            return state->mNearbyInputProc;
+        }
+        if (hwnd == state->mFriendsSearch)
+        {
+            return state->mFriendsSearchProc;
+        }
+        return state->mInputProc;
+    }
+
+    void delete_previous_word(HWND edit)
+    {
+        if (!edit)
+        {
+            return;
+        }
+
+        DWORD selection_start = 0;
+        DWORD selection_end = 0;
+        SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selection_start), reinterpret_cast<LPARAM>(&selection_end));
+        if (selection_start != selection_end)
+        {
+            SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+            return;
+        }
+
+        const int length = GetWindowTextLengthW(edit);
+        if (length <= 0 || selection_start == 0)
+        {
+            return;
+        }
+
+        std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+        GetWindowTextW(edit, text.data(), length + 1);
+        text.resize(static_cast<size_t>(length));
+
+        size_t start = std::min<size_t>(selection_start, text.size());
+        while (start > 0 && iswspace(text[start - 1]))
+        {
+            --start;
+        }
+        while (start > 0 && !iswspace(text[start - 1]))
+        {
+            --start;
+        }
+
+        SendMessageW(edit, EM_SETSEL, static_cast<WPARAM>(start), static_cast<LPARAM>(selection_start));
+        SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+    }
+
+    LRESULT CALLBACK input_edit_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+    {
+        auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(GetAncestor(hwnd, GA_ROOT), GWLP_USERDATA));
+        WNDPROC original_proc = original_input_proc(state, hwnd);
+
+        if (message == WM_KEYDOWN && wparam == VK_BACK && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            delete_previous_word(hwnd);
+            return 0;
+        }
+        if (message == WM_CHAR && wparam == 0x7f)
+        {
+            return 0;
+        }
+
+        return original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
     void subclass_message_view(WindowState* state, HWND hwnd, WNDPROC WindowState::* slot)
     {
         if (!state || !hwnd || (state->*slot))
@@ -733,6 +813,16 @@ namespace
         }
 
         (state->*slot) = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(message_view_proc)));
+    }
+
+    void subclass_input_edit(WindowState* state, HWND hwnd, WNDPROC WindowState::* slot)
+    {
+        if (!state || !hwnd || (state->*slot))
+        {
+            return;
+        }
+
+        (state->*slot) = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(input_edit_proc)));
     }
 
     bool is_people_visible(const WindowState* state)
@@ -2406,28 +2496,67 @@ namespace
         }
     }
 
-    void zoom_selected_person(WindowState* state)
+    std::wstring get_selected_person_id(WindowState* state)
     {
-        if (!state || !state->mPeopleList || state->mPipe == INVALID_HANDLE_VALUE)
+        if (!state || !state->mPeopleList)
         {
-            return;
+            return std::wstring();
         }
 
         const LRESULT selected = SendMessageW(state->mPeopleList, LB_GETCURSEL, 0, 0);
         if (selected == LB_ERR || selected <= 0)
         {
-            return;
+            return std::wstring();
         }
 
         const size_t person_index = static_cast<size_t>(selected - 1);
         const auto& ids = state->mRenderedPeopleIds[state->mPeopleActiveTab];
         if (person_index >= ids.size() || ids[person_index].empty())
         {
+            return std::wstring();
+        }
+
+        return ids[person_index];
+    }
+
+    void open_selected_person_im(WindowState* state)
+    {
+        if (!state || state->mPipe == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        const std::wstring person_id = get_selected_person_id(state);
+        if (person_id.empty())
+        {
+            return;
+        }
+
+        std::string line = "OPEN_IM|";
+        line += wide_to_utf8(person_id);
+        state->mPendingOpenParticipantId = person_id;
+        async_write_pipe_line(state->mPipe, line);
+        if (is_communications_target(state) && state->mActiveCommPanel != 4)
+        {
+            set_communications_panel(state, 4);
+        }
+    }
+
+    void zoom_selected_person(WindowState* state)
+    {
+        if (!state || state->mPipe == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        const std::wstring person_id = get_selected_person_id(state);
+        if (person_id.empty())
+        {
             return;
         }
 
         std::string line = "ZOOM_AVATAR|";
-        line += wide_to_utf8(ids[person_index]);
+        line += wide_to_utf8(person_id);
         async_write_pipe_line(state->mPipe, line);
     }
 
@@ -2489,6 +2618,51 @@ namespace
 
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, IDM_SESSION_CLOSE, L"Close IM");
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screen_point.x, screen_point.y, 0, hwnd, nullptr);
+        DestroyMenu(menu);
+    }
+
+    void show_people_context_menu(HWND hwnd, WindowState* state, int x, int y)
+    {
+        if (!state || !state->mPeopleList || !is_people_target(state))
+        {
+            return;
+        }
+
+        POINT screen_point = { x, y };
+        if (x == -1 && y == -1)
+        {
+            const LRESULT selected = SendMessageW(state->mPeopleList, LB_GETCURSEL, 0, 0);
+            if (selected == LB_ERR || selected <= 0)
+            {
+                return;
+            }
+            RECT item_rect = {};
+            SendMessageW(state->mPeopleList, LB_GETITEMRECT, selected, reinterpret_cast<LPARAM>(&item_rect));
+            screen_point = { item_rect.left + 8, item_rect.top + 8 };
+            ClientToScreen(state->mPeopleList, &screen_point);
+        }
+        else
+        {
+            POINT client_point = screen_point;
+            ScreenToClient(state->mPeopleList, &client_point);
+            const LRESULT hit = SendMessageW(state->mPeopleList, LB_ITEMFROMPOINT, 0, MAKELPARAM(client_point.x, client_point.y));
+            if (HIWORD(hit))
+            {
+                return;
+            }
+
+            const int index = LOWORD(hit);
+            if (index <= 0)
+            {
+                return;
+            }
+            SendMessageW(state->mPeopleList, LB_SETCURSEL, index, 0);
+        }
+
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, IDM_PERSON_IM, L"IM");
+        AppendMenuW(menu, MF_STRING, IDM_PERSON_ZOOM, L"Zoom In");
         TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screen_point.x, screen_point.y, 0, hwnd, nullptr);
         DestroyMenu(menu);
     }
@@ -2867,6 +3041,16 @@ namespace
                     close_selected_session(state);
                     return 0;
                 }
+                if (LOWORD(wparam) == IDM_PERSON_IM)
+                {
+                    open_selected_person_im(state);
+                    return 0;
+                }
+                if (LOWORD(wparam) == IDM_PERSON_ZOOM)
+                {
+                    zoom_selected_person(state);
+                    return 0;
+                }
                 if ((LOWORD(wparam) == IDC_INPUT || LOWORD(wparam) == IDC_NEARBY_INPUT) && HIWORD(wparam) == EN_UPDATE)
                 {
                     HWND input = reinterpret_cast<HWND>(lparam);
@@ -2972,7 +3156,6 @@ namespace
                 }
                 if (LOWORD(wparam) == IDC_PEOPLE_LIST && HIWORD(wparam) == LBN_DBLCLK)
                 {
-                    zoom_selected_person(state);
                     return 0;
                 }
                 if (LOWORD(wparam) == IDC_FRIENDS_LIST && HIWORD(wparam) == LBN_DBLCLK)
@@ -3004,6 +3187,11 @@ namespace
                 if (state && source == state->mSessions)
                 {
                     show_session_context_menu(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+                    return 0;
+                }
+                if (state && source == state->mPeopleList)
+                {
+                    show_people_context_menu(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
                     return 0;
                 }
                 if (source == hwnd)
@@ -3284,6 +3472,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
     apply_control_details(state);
     subclass_message_view(state, state->mMessages, &WindowState::mMessagesProc);
     subclass_message_view(state, state->mNearbyMessages, &WindowState::mNearbyMessagesProc);
+    subclass_input_edit(state, state->mInput, &WindowState::mInputProc);
+    subclass_input_edit(state, state->mNearbyInput, &WindowState::mNearbyInputProc);
+    subclass_input_edit(state, state->mFriendsSearch, &WindowState::mFriendsSearchProc);
 
     if (!pipe_name.empty())
     {
