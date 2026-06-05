@@ -23,6 +23,7 @@
 #include "llrecentpeople.h"
 #include "llsd.h"
 #include "llstring.h"
+#include "llurlaction.h"
 #include "llviewercontrol.h"
 #include "llworld.h"
 
@@ -152,6 +153,39 @@ namespace
             }
         }
         return value;
+    }
+
+    std::string base64_encode(const std::string& value)
+    {
+        static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string result;
+        int buffer = 0;
+        int bits = -6;
+        for (unsigned char ch : value)
+        {
+            buffer = (buffer << 8) | ch;
+            bits += 8;
+            while (bits >= 0)
+            {
+                result.push_back(alphabet[(buffer >> bits) & 0x3f]);
+                bits -= 6;
+            }
+        }
+        if (bits > -6)
+        {
+            result.push_back(alphabet[((buffer << 8) >> (bits + 8)) & 0x3f]);
+        }
+        while (result.size() % 4)
+        {
+            result.push_back('=');
+        }
+        return result;
+    }
+
+    std::string build_log_root_line()
+    {
+        std::string path = gDirUtilp ? gDirUtilp->getPerAccountChatLogsDir() : std::string();
+        return "LOG_ROOT|" + base64_encode(path);
     }
 
     bool write_pipe_line(HANDLE pipe, const std::string& line)
@@ -653,6 +687,7 @@ void FSExternalFloaterHost::sendInitialConversationSnapshot(HANDLE pipe)
     {
         traceLine("sendInitialConversationSnapshot begin");
         write_pipe_line(pipe, "READY|Firestorm conversation bridge");
+        write_pipe_line(pipe, build_log_root_line());
         write_pipe_line(pipe, "DEBUG|Snapshot requested from Firestorm conversation model");
 
         S32 session_count = 0;
@@ -828,6 +863,28 @@ void FSExternalFloaterHost::handlePipeCommand(const std::string& line)
             LLMainThreadTask::dispatch([avatar_id]()
             {
                 LLAvatarActions::zoomIn(avatar_id);
+            });
+        }
+        return;
+    }
+
+    if (parts.size() >= 2 && parts[0] == "OPEN_SLURL")
+    {
+        const std::string url = parts[1];
+        if (!url.empty())
+        {
+            LLMainThreadTask::dispatch([url]()
+            {
+                const std::string lowered = utf8str_tolower(url);
+                if (lowered.rfind("http://maps.secondlife.com/", 0) == 0 ||
+                    lowered.rfind("https://maps.secondlife.com/", 0) == 0)
+                {
+                    LLUrlAction::showLocationOnMap(url);
+                }
+                else
+                {
+                    LLUrlAction::executeSLURL(url, true);
+                }
             });
         }
         return;

@@ -12,6 +12,8 @@
 #include <set>
 #include <cstdio>
 #include <cwctype>
+#include <cwchar>
+#include <filesystem>
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -45,6 +47,19 @@ namespace
         bool mHistory = false;
     };
 
+    struct RichLinkRange
+    {
+        LONG mStart = 0;
+        LONG mEnd = 0;
+        std::wstring mTarget;
+    };
+
+    struct LogEntry
+    {
+        std::wstring mName;
+        std::wstring mPath;
+    };
+
     struct WindowState
     {
         std::wstring mTarget;
@@ -53,7 +68,7 @@ namespace
         HWND mMessages = nullptr;
         HWND mInput = nullptr;
         HWND mSend = nullptr;
-        HWND mCommTabs[5] = {};
+        HWND mCommTabs[6] = {};
         int mActiveCommPanel = 4;
         int mAllSplitX = 62;
         int mAllSplitY = 70;
@@ -86,13 +101,25 @@ namespace
         int mRenderedFriendsSortColumn = -1;
         bool mRenderedFriendsSortAscending = true;
         std::wstring mRenderedFriendsFilter;
-        int mFriendsSortColumn = 0;
+        int mFriendsSortColumn = 1;
         bool mFriendsSortAscending = true;
         std::wstring mPendingOpenParticipantId;
         std::set<std::wstring> mLocallyClosedSessionIds;
         bool mFriendsRefreshDeferred = false;
+        HWND mLogsSearch = nullptr;
+        HWND mLogsList = nullptr;
+        HWND mLogFind = nullptr;
+        HWND mLogFindButton = nullptr;
+        HWND mLogView = nullptr;
+        std::wstring mLogRoot;
+        std::vector<LogEntry> mLogEntries;
+        std::vector<size_t> mRenderedLogIndexes;
+        std::wstring mLoadedLogPath;
+        LONG mLogFindStart = 0;
         std::map<std::wstring, std::vector<DisplayMessage>> mSessionMessages;
         std::map<std::wstring, std::set<std::wstring>> mSessionMessageKeys;
+        std::map<HWND, std::vector<RichLinkRange>> mRichLinks;
+        std::map<HWND, LONG> mHoveredRichLinkStart;
         HANDLE mPipe = INVALID_HANDLE_VALUE;
         std::wstring mPipeName;
         bool mClosing = false;
@@ -105,9 +132,13 @@ namespace
         HBRUSH mFieldBrush = nullptr;
         WNDPROC mMessagesProc = nullptr;
         WNDPROC mNearbyMessagesProc = nullptr;
+        WNDPROC mLogViewProc = nullptr;
         WNDPROC mInputProc = nullptr;
         WNDPROC mNearbyInputProc = nullptr;
         WNDPROC mFriendsSearchProc = nullptr;
+        WNDPROC mLogsSearchProc = nullptr;
+        WNDPROC mLogFindProc = nullptr;
+        WNDPROC mPeopleListProc = nullptr;
         AppTheme mTheme;
     };
 
@@ -139,12 +170,16 @@ namespace
     constexpr int IDC_NEARBY_SEND = 1032;
     constexpr int IDC_FRIENDS_LIST = 1040;
     constexpr int IDC_FRIENDS_SEARCH = 1041;
+    constexpr int IDC_COMM_LOGS = 1050;
+    constexpr int IDC_LOGS_SEARCH = 1051;
+    constexpr int IDC_LOGS_LIST = 1052;
+    constexpr int IDC_LOG_FIND = 1053;
+    constexpr int IDC_LOG_FIND_BUTTON = 1054;
+    constexpr int IDC_LOG_VIEW = 1055;
     constexpr int IDM_THEME_DRACULA = 2001;
     constexpr int IDM_THEME_SAVE = 2002;
     constexpr int IDM_THEME_LOAD = 2003;
     constexpr int IDM_SESSION_CLOSE = 2101;
-    constexpr int IDM_PERSON_IM = 2201;
-    constexpr int IDM_PERSON_ZOOM = 2202;
     constexpr UINT WM_PIPE_LINE = WM_APP + 1;
     constexpr UINT WM_PIPE_DISCONNECTED = WM_APP + 2;
     constexpr UINT WM_PIPE_RECONNECTED = WM_APP + 3;
@@ -158,10 +193,24 @@ namespace
     constexpr DWORD MESSAGE_VIEW_STYLE = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL;
 
     bool is_rich_edit(HWND hwnd);
+    std::wstring lower_text(std::wstring value);
+    std::wstring session_list_display_name(const std::wstring& name);
+    std::wstring transcript_speaker_name(WindowState* state, const std::wstring& session_id, const std::wstring& speaker);
     int compare_table_rows(const std::wstring& left, const std::wstring& right, int column, bool people);
+    int compare_friend_rows(const std::wstring& left, const std::wstring& right, int column);
     std::wstring table_header_text(const wchar_t* const* labels, int count, int sort_column, bool ascending);
     int table_column_from_client_x(HWND listbox, int control_id, int x);
     void apply_dark_title_bar(HWND hwnd, const AppTheme& theme);
+    void send_current_message(WindowState* state);
+    void send_nearby_message(WindowState* state);
+    void load_selected_log(WindowState* state);
+    void load_first_matching_log(WindowState* state);
+    void find_next_in_loaded_log(WindowState* state);
+    std::wstring get_person_id_at_list_index(WindowState* state, LRESULT list_index);
+    void open_person_im(WindowState* state, const std::wstring& person_id);
+    void open_selected_person_im(WindowState* state);
+    void open_companion_link(WindowState* state, const std::wstring& link);
+    std::wstring get_rich_text_range(HWND edit, CHARRANGE range);
 
     void trace_line(const std::string& message)
     {
@@ -590,17 +639,67 @@ namespace
         return wcscmp(class_name, L"RICHEDIT50W") == 0 || wcscmp(class_name, L"RichEdit20W") == 0;
     }
 
-    std::wstring action_body_from_message(const std::wstring& message)
+    bool action_parts_from_message(
+        const std::wstring& speaker,
+        const std::wstring& message,
+        std::wstring* action_speaker,
+        std::wstring* action_body)
     {
+        if (action_speaker)
+        {
+            action_speaker->clear();
+        }
+        if (action_body)
+        {
+            action_body->clear();
+        }
+
         if (message == L"/me")
         {
-            return std::wstring();
+            if (action_speaker)
+            {
+                *action_speaker = speaker;
+            }
+            return true;
         }
         if (message.rfind(L"/me ", 0) == 0)
         {
-            return message.substr(4);
+            if (action_speaker)
+            {
+                *action_speaker = speaker;
+            }
+            if (action_body)
+            {
+                *action_body = L" " + message.substr(4);
+            }
+            return true;
         }
-        return std::wstring();
+        if (message.rfind(L"/me's ", 0) == 0)
+        {
+            if (action_speaker)
+            {
+                *action_speaker = speaker;
+            }
+            if (action_body)
+            {
+                *action_body = L"'s " + message.substr(6);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool is_online_status_notice(const std::wstring& sender, const std::wstring& message)
+    {
+        if (lower_text(sender) != L"second life")
+        {
+            return false;
+        }
+
+        const std::wstring lowered = lower_text(message);
+        return lowered.size() >= 12 &&
+            (lowered.rfind(L" is online.") == lowered.size() - 11 ||
+             lowered.rfind(L" is offline.") == lowered.size() - 12);
     }
 
     void append_rich_segment(HWND edit, const std::wstring& text, COLORREF color, bool italic)
@@ -612,20 +711,617 @@ namespace
 
         CHARFORMAT2W format = {};
         format.cbSize = sizeof(format);
-        format.dwMask = CFM_COLOR | CFM_ITALIC;
+        format.dwMask = CFM_COLOR | CFM_ITALIC | CFM_LINK | CFM_UNDERLINE;
         format.dwEffects = italic ? CFE_ITALIC : 0;
         format.crTextColor = color;
         SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
         SendMessageW(edit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
     }
 
-    void append_text_line(HWND edit, const std::wstring& line, bool history = false)
+    void apply_rich_text_color(HWND edit, COLORREF color)
     {
         if (!edit)
         {
             return;
         }
 
+        CHARRANGE selection = {};
+        SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+
+        CHARFORMAT2W format = {};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR;
+        format.crTextColor = color;
+
+        SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
+    }
+
+    void remember_rich_link(HWND edit, LONG start, LONG end, const std::wstring& target)
+    {
+        if (!edit || target.empty() || end <= start)
+        {
+            return;
+        }
+
+        auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(GetAncestor(edit, GA_ROOT), GWLP_USERDATA));
+        if (!state)
+        {
+            return;
+        }
+
+        state->mRichLinks[edit].push_back({ start, end, target });
+    }
+
+    std::wstring get_rich_link_target_at_char(WindowState* state, HWND edit, LONG char_index)
+    {
+        if (!state || !edit || char_index < 0)
+        {
+            return std::wstring();
+        }
+
+        const auto found = state->mRichLinks.find(edit);
+        if (found == state->mRichLinks.end())
+        {
+            return std::wstring();
+        }
+
+        for (const RichLinkRange& link : found->second)
+        {
+            if (char_index >= link.mStart && char_index < link.mEnd)
+            {
+                return link.mTarget;
+            }
+        }
+        return std::wstring();
+    }
+
+    bool rich_link_range_contains_point(HWND edit, const RichLinkRange& link, int x, int y)
+    {
+        if (!edit || link.mEnd <= link.mStart)
+        {
+            return false;
+        }
+
+        RECT client = {};
+        if (!GetClientRect(edit, &client))
+        {
+            return false;
+        }
+
+        POINTL first = {};
+        POINTL last = {};
+        if (SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&first), static_cast<LPARAM>(link.mStart)) == -1 ||
+            SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&last), static_cast<LPARAM>(link.mEnd - 1)) == -1)
+        {
+            return false;
+        }
+
+        TEXTMETRICW metrics = {};
+        HDC dc = GetDC(edit);
+        if (dc)
+        {
+            GetTextMetricsW(dc, &metrics);
+            ReleaseDC(edit, dc);
+        }
+        const int line_height = metrics.tmHeight > 0 ? metrics.tmHeight + metrics.tmExternalLeading + 2 : 18;
+        const LRESULT first_line = SendMessageW(edit, EM_EXLINEFROMCHAR, 0, link.mStart);
+        const LRESULT last_line = SendMessageW(edit, EM_EXLINEFROMCHAR, 0, link.mEnd - 1);
+        if (first_line == last_line)
+        {
+            std::wstring segment = get_rich_text_range(edit, { link.mStart, link.mEnd });
+            SIZE text_size = {};
+            HDC text_dc = GetDC(edit);
+            if (text_dc)
+            {
+                GetTextExtentPoint32W(text_dc, segment.c_str(), static_cast<int>(segment.size()), &text_size);
+                ReleaseDC(edit, text_dc);
+            }
+            RECT rect = {
+                std::min(first.x, last.x),
+                first.y,
+                text_size.cx > 0 ? first.x + text_size.cx : std::max(first.x, last.x) + 8,
+                first.y + line_height
+            };
+            return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+        }
+
+        for (LRESULT line = first_line; line <= last_line; ++line)
+        {
+            const LONG line_start = static_cast<LONG>(SendMessageW(edit, EM_LINEINDEX, line, 0));
+            const LONG next_line_start = static_cast<LONG>(SendMessageW(edit, EM_LINEINDEX, line + 1, 0));
+            const LONG line_end = next_line_start >= 0 ? next_line_start : GetWindowTextLengthW(edit);
+            const LONG segment_start = std::max(link.mStart, line_start);
+            const LONG segment_end = std::min(link.mEnd, line_end);
+            if (segment_end <= segment_start)
+            {
+                continue;
+            }
+
+            POINTL segment_first = {};
+            POINTL segment_last = {};
+            if (SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&segment_first), segment_start) == -1 ||
+                SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&segment_last), segment_end - 1) == -1)
+            {
+                continue;
+            }
+
+            std::wstring segment = get_rich_text_range(edit, { segment_start, segment_end });
+            SIZE text_size = {};
+            HDC text_dc = GetDC(edit);
+            if (text_dc)
+            {
+                GetTextExtentPoint32W(text_dc, segment.c_str(), static_cast<int>(segment.size()), &text_size);
+                ReleaseDC(edit, text_dc);
+            }
+            RECT rect = {
+                segment_first.x,
+                segment_first.y,
+                text_size.cx > 0 ? segment_first.x + text_size.cx : segment_last.x + 8,
+                segment_first.y + line_height
+            };
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    RichLinkRange* get_rich_link_at_point(WindowState* state, HWND edit, int x, int y)
+    {
+        if (!state || !edit)
+        {
+            return nullptr;
+        }
+
+        auto found = state->mRichLinks.find(edit);
+        if (found == state->mRichLinks.end())
+        {
+            return nullptr;
+        }
+
+        for (RichLinkRange& link : found->second)
+        {
+            if (rich_link_range_contains_point(edit, link, x, y))
+            {
+                return &link;
+            }
+        }
+        return nullptr;
+    }
+
+    void set_rich_link_hover(HWND edit, const RichLinkRange& link, bool hovered)
+    {
+        if (!edit || link.mEnd <= link.mStart)
+        {
+            return;
+        }
+
+        CHARRANGE previous_selection = {};
+        SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&previous_selection));
+
+        CHARFORMAT2W format = {};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR | CFM_UNDERLINE;
+        format.dwEffects = hovered ? CFE_UNDERLINE : 0;
+        format.crTextColor = NOTICE_TEXT_COLOR;
+
+        SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
+        SendMessageW(edit, EM_SETSEL, link.mStart, link.mEnd);
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&previous_selection));
+        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
+        HideCaret(edit);
+    }
+
+    void update_rich_link_hover(WindowState* state, HWND edit, int x, int y)
+    {
+        if (!state || !edit)
+        {
+            return;
+        }
+
+        RichLinkRange* hovered = get_rich_link_at_point(state, edit, x, y);
+        const LONG hovered_start = hovered ? hovered->mStart : -1;
+        LONG& previous_start = state->mHoveredRichLinkStart[edit];
+        if (previous_start == hovered_start)
+        {
+            return;
+        }
+
+        auto found = state->mRichLinks.find(edit);
+        if (found != state->mRichLinks.end())
+        {
+            for (const RichLinkRange& link : found->second)
+            {
+                if (link.mStart == previous_start)
+                {
+                    set_rich_link_hover(edit, link, false);
+                    break;
+                }
+            }
+        }
+        if (hovered)
+        {
+            set_rich_link_hover(edit, *hovered, true);
+        }
+        previous_start = hovered_start;
+    }
+
+    bool starts_with_ci(const std::wstring& value, const std::wstring& prefix)
+    {
+        if (value.size() < prefix.size())
+        {
+            return false;
+        }
+
+        return lower_text(value.substr(0, prefix.size())) == lower_text(prefix);
+    }
+
+    bool is_url_trailing_punctuation(wchar_t ch)
+    {
+        return ch == L'.' || ch == L',' || ch == L';' || ch == L':' || ch == L'!' ||
+            ch == L'?' || ch == L')' || ch == L']' || ch == L'}' || ch == L'"' || ch == L'\'';
+    }
+
+    bool is_link_start(const std::wstring& text, size_t index, const wchar_t* prefix)
+    {
+        const size_t prefix_length = wcslen(prefix);
+        return index + prefix_length <= text.size() &&
+            lower_text(text.substr(index, prefix_length)) == lower_text(prefix);
+    }
+
+    size_t find_next_link_start(const std::wstring& text, size_t start)
+    {
+        size_t result = std::wstring::npos;
+        for (const wchar_t* prefix : { L"http://", L"https://", L"secondlife:///" })
+        {
+            size_t pos = lower_text(text).find(lower_text(prefix), start);
+            if (pos != std::wstring::npos && (result == std::wstring::npos || pos < result))
+            {
+                result = pos;
+            }
+        }
+        return result;
+    }
+
+    size_t find_link_end(const std::wstring& text, size_t start)
+    {
+        size_t end = start;
+        while (end < text.size() && !iswspace(text[end]))
+        {
+            ++end;
+        }
+        while (end > start && is_url_trailing_punctuation(text[end - 1]))
+        {
+            --end;
+        }
+        return end;
+    }
+
+    void append_rich_link_segment(HWND edit, const std::wstring& text, const std::wstring& target, COLORREF color, bool italic)
+    {
+        if (text.empty())
+        {
+            return;
+        }
+
+        CHARRANGE before_insert = {};
+        SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&before_insert));
+        const LONG start = before_insert.cpMin;
+        CHARFORMAT2W format = {};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR | CFM_ITALIC | CFM_UNDERLINE;
+        format.dwEffects = italic ? CFE_ITALIC : 0;
+        format.crTextColor = NOTICE_TEXT_COLOR;
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(edit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+        CHARRANGE after_insert = {};
+        SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&after_insert));
+        const LONG end = after_insert.cpMin;
+        remember_rich_link(edit, start, end, target.empty() ? text : target);
+    }
+
+    void append_rich_text_with_links(HWND edit, const std::wstring& text, COLORREF color, bool italic)
+    {
+        size_t cursor = 0;
+        while (cursor < text.size())
+        {
+            const size_t link_start = find_next_link_start(text, cursor);
+            if (link_start == std::wstring::npos)
+            {
+                append_rich_segment(edit, text.substr(cursor), color, italic);
+                return;
+            }
+
+            if (link_start > cursor)
+            {
+                append_rich_segment(edit, text.substr(cursor, link_start - cursor), color, italic);
+            }
+
+            const size_t link_end = find_link_end(text, link_start);
+            if (link_end <= link_start)
+            {
+                append_rich_segment(edit, text.substr(link_start, 1), color, italic);
+                cursor = link_start + 1;
+                continue;
+            }
+
+            const std::wstring link = text.substr(link_start, link_end - link_start);
+            append_rich_link_segment(edit, link, link, color, italic);
+            cursor = link_end;
+        }
+    }
+
+    int hex_value(wchar_t ch)
+    {
+        if (ch >= L'0' && ch <= L'9') return ch - L'0';
+        if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
+        if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
+        return -1;
+    }
+
+    std::wstring url_decode_basic(const std::wstring& text)
+    {
+        std::wstring result;
+        for (size_t index = 0; index < text.size(); ++index)
+        {
+            if (text[index] == L'%' && index + 2 < text.size())
+            {
+                const int high = hex_value(text[index + 1]);
+                const int low = hex_value(text[index + 2]);
+                if (high >= 0 && low >= 0)
+                {
+                    result.push_back(static_cast<wchar_t>((high << 4) | low));
+                    index += 2;
+                    continue;
+                }
+            }
+            result.push_back(text[index] == L'+' ? L' ' : text[index]);
+        }
+        return result;
+    }
+
+    std::wstring map_label_from_url(const std::wstring& url)
+    {
+        const std::wstring lowered = lower_text(url);
+        const std::wstring marker = L"/secondlife/";
+        size_t marker_pos = lowered.find(marker);
+        if (marker_pos == std::wstring::npos)
+        {
+            return url;
+        }
+
+        size_t cursor = marker_pos + marker.size();
+        const size_t region_end = url.find(L'/', cursor);
+        if (region_end == std::wstring::npos)
+        {
+            return url_decode_basic(url.substr(cursor));
+        }
+
+        const std::wstring region = url_decode_basic(url.substr(cursor, region_end - cursor));
+        cursor = region_end + 1;
+        const size_t x_end = url.find(L'/', cursor);
+        if (x_end == std::wstring::npos)
+        {
+            return region;
+        }
+        const std::wstring x = url.substr(cursor, x_end - cursor);
+        cursor = x_end + 1;
+        const size_t y_end = url.find(L'/', cursor);
+        if (y_end == std::wstring::npos)
+        {
+            return region + L" (" + x + L")";
+        }
+        const std::wstring y = url.substr(cursor, y_end - cursor);
+        cursor = y_end + 1;
+        size_t z_end = cursor;
+        while (z_end < url.size() && iswdigit(url[z_end]))
+        {
+            ++z_end;
+        }
+        const std::wstring z = url.substr(cursor, z_end - cursor);
+        return region + L" (" + x + L"," + y + (z.empty() ? L"" : L"," + z) + L")";
+    }
+
+    std::wstring strip_icon_tags(std::wstring text)
+    {
+        size_t icon_start = std::wstring::npos;
+        while ((icon_start = lower_text(text).find(L"<icon>")) != std::wstring::npos)
+        {
+            const size_t icon_end = lower_text(text).find(L"</icon>", icon_start);
+            if (icon_end == std::wstring::npos)
+            {
+                text.erase(icon_start);
+                break;
+            }
+            std::wstring replacement;
+            const std::wstring icon_name = text.substr(icon_start + 6, icon_end - icon_start - 6);
+            if (icon_name == L"Parcel_M_Dark")
+            {
+                replacement = L"M";
+            }
+            else if (icon_name == L"Parcel_PG_Dark")
+            {
+                replacement = L"G";
+            }
+            else if (icon_name == L"Parcel_R_Dark")
+            {
+                replacement = L"A";
+            }
+            text.replace(icon_start, icon_end + 7 - icon_start, replacement);
+        }
+        return text;
+    }
+
+    std::wstring find_session_name_for_agent(WindowState* state, const std::wstring& agent_url)
+    {
+        if (!state || !state->mSessions)
+        {
+            return std::wstring();
+        }
+
+        const std::wstring marker = L"secondlife:///app/agent/";
+        if (lower_text(agent_url).rfind(marker, 0) != 0)
+        {
+            return std::wstring();
+        }
+        const size_t id_start = marker.size();
+        const size_t id_end = agent_url.find(L'/', id_start);
+        const std::wstring agent_id = agent_url.substr(id_start, id_end == std::wstring::npos ? std::wstring::npos : id_end - id_start);
+        if (agent_id.empty())
+        {
+            return std::wstring();
+        }
+
+        const LRESULT count = SendMessageW(state->mSessions, LB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index)
+        {
+            auto session = reinterpret_cast<SessionInfo*>(SendMessageW(state->mSessions, LB_GETITEMDATA, index, 0));
+            if (session && lower_text(session->mOtherParticipantId) == lower_text(agent_id))
+            {
+                return session->mName;
+            }
+        }
+        return std::wstring();
+    }
+
+    bool append_teleport_offer_line(HWND edit, const std::wstring& speaker, const std::wstring& message, COLORREF name_color, COLORREF body_color)
+    {
+        auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(GetAncestor(edit, GA_ROOT), GWLP_USERDATA));
+        const std::wstring offer_text = L" has offered to teleport you to their location ";
+        const size_t offer_pos = message.find(offer_text);
+        if (offer_pos == std::wstring::npos)
+        {
+            return false;
+        }
+
+        const std::wstring agent_url = message.substr(0, offer_pos);
+        if (lower_text(agent_url).rfind(L"secondlife:///app/agent/", 0) != 0)
+        {
+            return false;
+        }
+
+        const size_t location_open = message.find(L'(', offer_pos + offer_text.size());
+        const size_t location_close = message.find(L"):", location_open == std::wstring::npos ? offer_pos : location_open);
+        if (location_open == std::wstring::npos || location_close == std::wstring::npos)
+        {
+            return false;
+        }
+
+        const std::wstring location_url = message.substr(location_open + 1, location_close - location_open - 1);
+        std::wstring agent_name = find_session_name_for_agent(state, agent_url);
+        if (agent_name.empty())
+        {
+            agent_name = L"Resident";
+        }
+
+        append_rich_segment(edit, speaker + L":\r\n", name_color, false);
+        append_rich_link_segment(edit, agent_name, agent_url, name_color, false);
+        append_rich_segment(edit, offer_text, body_color, false);
+        append_rich_segment(edit, L"(", body_color, false);
+        append_rich_link_segment(edit, map_label_from_url(location_url), location_url, body_color, false);
+        append_rich_segment(edit, L"):\r\n", body_color, false);
+
+        std::wstring body = strip_icon_tags(message.substr(location_close + 2));
+        while (!body.empty() && iswspace(body.front()))
+        {
+            body.erase(body.begin());
+        }
+
+        size_t cursor = 0;
+        bool wrote_body = false;
+        while (cursor < body.size())
+        {
+            const size_t map_pos = find_next_link_start(body, cursor);
+            if (map_pos == std::wstring::npos)
+            {
+                append_rich_text_with_links(edit, body.substr(cursor), body_color, false);
+                wrote_body = true;
+                break;
+            }
+            if (map_pos > cursor)
+            {
+                append_rich_text_with_links(edit, body.substr(cursor, map_pos - cursor), body_color, false);
+                wrote_body = true;
+            }
+            const size_t map_end = find_link_end(body, map_pos);
+            const std::wstring map_url = body.substr(map_pos, map_end - map_pos);
+            if (wrote_body)
+            {
+                append_rich_segment(edit, L"\r\n", body_color, false);
+            }
+            append_rich_link_segment(edit, map_label_from_url(map_url), map_url, body_color, false);
+            cursor = map_end;
+            wrote_body = true;
+        }
+
+        append_rich_segment(edit, L"\r\n", body_color, false);
+        return true;
+    }
+
+    bool is_message_view_at_bottom(HWND edit)
+    {
+        if (!edit)
+        {
+            return true;
+        }
+
+        SCROLLINFO scroll = {};
+        scroll.cbSize = sizeof(scroll);
+        scroll.fMask = SIF_PAGE | SIF_POS | SIF_RANGE;
+        if (GetScrollInfo(edit, SB_VERT, &scroll))
+        {
+            return scroll.nPos + static_cast<int>(scroll.nPage) >= scroll.nMax - 1;
+        }
+
+        const LRESULT first_visible = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        const LRESULT line_count = SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
+        return first_visible >= line_count - 3;
+    }
+
+    void restore_message_view_scroll(HWND edit, int first_visible_line)
+    {
+        if (!edit || first_visible_line < 0)
+        {
+            return;
+        }
+
+        const int current_first_visible = static_cast<int>(SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0));
+        if (current_first_visible != first_visible_line)
+        {
+            SendMessageW(edit, EM_LINESCROLL, 0, first_visible_line - current_first_visible);
+        }
+    }
+
+    void finish_message_view_append(HWND edit, bool was_at_bottom, int first_visible_line)
+    {
+        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
+        if (was_at_bottom)
+        {
+            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+        }
+        else
+        {
+            restore_message_view_scroll(edit, first_visible_line);
+        }
+        HideCaret(edit);
+    }
+
+    void append_text_line(HWND edit, const std::wstring& line, bool history = false, bool force_scroll_bottom = false)
+    {
+        if (!edit)
+        {
+            return;
+        }
+
+        const bool was_at_bottom = force_scroll_bottom || is_message_view_at_bottom(edit);
+        const int first_visible_line = static_cast<int>(SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0));
         const int length = GetWindowTextLengthW(edit);
         SendMessageW(edit, EM_SETSEL, length, length);
         SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
@@ -640,27 +1336,32 @@ namespace
             {
                 const std::wstring speaker = line.substr(0, separator);
                 const std::wstring message = line.substr(separator + 2);
-                const std::wstring action = action_body_from_message(message);
-                if (!action.empty() || message == L"/me")
+                if (lower_text(speaker) == L"second life" && append_teleport_offer_line(edit, speaker, message, name_color, body_color))
                 {
-                    append_rich_segment(edit, speaker, name_color, true);
-                    if (!action.empty())
-                    {
-                        append_rich_segment(edit, L" ", body_color, true);
-                        append_rich_segment(edit, action, body_color, true);
-                    }
+                    // append_teleport_offer_line writes its own trailing newline.
+                }
+                else
+                {
+                std::wstring action_speaker;
+                std::wstring action_body;
+                if (action_parts_from_message(speaker, message, &action_speaker, &action_body))
+                {
+                    append_rich_segment(edit, action_speaker, name_color, true);
+                    append_rich_text_with_links(edit, action_body, body_color, true);
                 }
                 else
                 {
                     append_rich_segment(edit, speaker + L": ", name_color, false);
-                    append_rich_segment(edit, message, body_color, false);
+                    append_rich_text_with_links(edit, message, body_color, false);
+                }
+                    append_rich_segment(edit, L"\r\n", body_color, false);
                 }
             }
             else
             {
-                append_rich_segment(edit, line, body_color, false);
+                append_rich_text_with_links(edit, line, body_color, false);
+                append_rich_segment(edit, L"\r\n", body_color, false);
             }
-            append_rich_segment(edit, L"\r\n", body_color, false);
         }
         else
         {
@@ -668,9 +1369,7 @@ namespace
             text += L"\r\n";
             SendMessageW(edit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
         }
-        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
-        SendMessageW(edit, EM_SCROLLCARET, 0, 0);
-        HideCaret(edit);
+        finish_message_view_append(edit, was_at_bottom, first_visible_line);
     }
 
     void append_notice_line(HWND edit, const std::wstring& line)
@@ -680,6 +1379,8 @@ namespace
             return;
         }
 
+        const bool was_at_bottom = is_message_view_at_bottom(edit);
+        const int first_visible_line = static_cast<int>(SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0));
         const int length = GetWindowTextLengthW(edit);
         SendMessageW(edit, EM_SETSEL, length, length);
         SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
@@ -694,9 +1395,7 @@ namespace
             text += L"\r\n";
             SendMessageW(edit, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
         }
-        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
-        SendMessageW(edit, EM_SCROLLCARET, 0, 0);
-        HideCaret(edit);
+        finish_message_view_append(edit, was_at_bottom, first_visible_line);
     }
 
     LRESULT CALLBACK message_view_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
@@ -705,24 +1404,70 @@ namespace
         WNDPROC original_proc = nullptr;
         if (state)
         {
-            original_proc = (hwnd == state->mNearbyMessages) ? state->mNearbyMessagesProc : state->mMessagesProc;
+            if (hwnd == state->mNearbyMessages)
+            {
+                original_proc = state->mNearbyMessagesProc;
+            }
+            else if (hwnd == state->mLogView)
+            {
+                original_proc = state->mLogViewProc;
+            }
+            else
+            {
+                original_proc = state->mMessagesProc;
+            }
         }
 
         switch (message)
         {
             case WM_SETFOCUS:
             case WM_LBUTTONDOWN:
-            case WM_LBUTTONUP:
-            case WM_MOUSEMOVE:
             case WM_KEYDOWN:
             {
                 const LRESULT result = original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
                 HideCaret(hwnd);
                 return result;
             }
+            case WM_MOUSEMOVE:
+            {
+                update_rich_link_hover(state, hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+                TRACKMOUSEEVENT track = {};
+                track.cbSize = sizeof(track);
+                track.dwFlags = TME_LEAVE;
+                track.hwndTrack = hwnd;
+                TrackMouseEvent(&track);
+                const LRESULT result = original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
+                HideCaret(hwnd);
+                return result;
+            }
+            case WM_MOUSELEAVE:
+            {
+                update_rich_link_hover(state, hwnd, -1, -1);
+                HideCaret(hwnd);
+                return 0;
+            }
+            case WM_LBUTTONUP:
+            {
+                RichLinkRange* link = get_rich_link_at_point(state, hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+                if (link && !link->mTarget.empty())
+                {
+                    open_companion_link(state, link->mTarget);
+                    HideCaret(hwnd);
+                    return 0;
+                }
+                const LRESULT result = original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
+                HideCaret(hwnd);
+                return result;
+            }
             case WM_SETCURSOR:
-                SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            {
+                POINT point = {};
+                GetCursorPos(&point);
+                ScreenToClient(hwnd, &point);
+                const RichLinkRange* link = get_rich_link_at_point(state, hwnd, point.x, point.y);
+                SetCursor(LoadCursor(nullptr, link ? IDC_HAND : IDC_ARROW));
                 return TRUE;
+            }
             default:
                 break;
         }
@@ -743,6 +1488,14 @@ namespace
         if (hwnd == state->mFriendsSearch)
         {
             return state->mFriendsSearchProc;
+        }
+        if (hwnd == state->mLogsSearch)
+        {
+            return state->mLogsSearchProc;
+        }
+        if (hwnd == state->mLogFind)
+        {
+            return state->mLogFindProc;
         }
         return state->mInputProc;
     }
@@ -792,6 +1545,45 @@ namespace
         auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(GetAncestor(hwnd, GA_ROOT), GWLP_USERDATA));
         WNDPROC original_proc = original_input_proc(state, hwnd);
 
+        if (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) && (wparam == L'A' || wparam == L'a'))
+        {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if (message == WM_KEYDOWN && wparam == VK_RETURN && state && (hwnd == state->mInput || hwnd == state->mNearbyInput))
+        {
+            if (hwnd == state->mNearbyInput)
+            {
+                send_nearby_message(state);
+            }
+            else
+            {
+                send_current_message(state);
+            }
+            return 0;
+        }
+        if (message == WM_KEYDOWN && wparam == VK_RETURN && state && hwnd == state->mLogsSearch)
+        {
+            load_first_matching_log(state);
+            return 0;
+        }
+        if (message == WM_KEYDOWN && wparam == VK_RETURN && state && hwnd == state->mLogFind)
+        {
+            find_next_in_loaded_log(state);
+            return 0;
+        }
+        if (message == WM_CHAR && wparam == L'\r' && state && (hwnd == state->mInput || hwnd == state->mNearbyInput))
+        {
+            return 0;
+        }
+        if (message == WM_CHAR && wparam == L'\r' && state && (hwnd == state->mLogsSearch || hwnd == state->mLogFind))
+        {
+            return 0;
+        }
+        if (message == WM_CHAR && wparam == 0x01 && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            return 0;
+        }
         if (message == WM_KEYDOWN && wparam == VK_BACK && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             delete_previous_word(hwnd);
@@ -800,6 +1592,31 @@ namespace
         if (message == WM_CHAR && wparam == 0x7f)
         {
             return 0;
+        }
+
+        return original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    LRESULT CALLBACK people_list_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+    {
+        auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(GetAncestor(hwnd, GA_ROOT), GWLP_USERDATA));
+        WNDPROC original_proc = state ? state->mPeopleListProc : nullptr;
+
+        if (message == WM_LBUTTONDBLCLK && state && hwnd == state->mPeopleList)
+        {
+            const int x = GET_X_LPARAM(lparam);
+            const int y = GET_Y_LPARAM(lparam);
+            const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(x, y));
+            if (!HIWORD(hit))
+            {
+                const int index = LOWORD(hit);
+                if (index > 0)
+                {
+                    SendMessageW(hwnd, LB_SETCURSEL, index, 0);
+                    open_person_im(state, get_person_id_at_list_index(state, index));
+                    return 0;
+                }
+            }
         }
 
         return original_proc ? CallWindowProcW(original_proc, hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
@@ -823,6 +1640,16 @@ namespace
         }
 
         (state->*slot) = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(input_edit_proc)));
+    }
+
+    void subclass_people_list(WindowState* state)
+    {
+        if (!state || !state->mPeopleList || state->mPeopleListProc)
+        {
+            return;
+        }
+
+        state->mPeopleListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(state->mPeopleList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(people_list_proc)));
     }
 
     bool is_people_visible(const WindowState* state)
@@ -1043,7 +1870,7 @@ namespace
         const bool ascending = state->mFriendsSortAscending;
         std::stable_sort(friends.begin(), friends.end(), [sort_column, ascending](const auto& left, const auto& right)
         {
-            const int result = compare_table_rows(left.first, right.first, sort_column, false);
+            const int result = compare_friend_rows(left.first, right.first, sort_column);
             return ascending ? result < 0 : result > 0;
         });
         std::vector<std::wstring> rendered_rows;
@@ -1284,6 +2111,8 @@ namespace
             return;
         }
 
+        state->mRichLinks[state->mMessages].clear();
+        state->mHoveredRichLinkStart[state->mMessages] = -1;
         SetWindowTextW(state->mMessages, L"");
 
         SessionInfo* session = get_selected_session(state);
@@ -1299,7 +2128,7 @@ namespace
         {
             for (const DisplayMessage& message : messages->second)
             {
-                append_text_line(state->mMessages, message.mText, message.mHistory);
+                append_text_line(state->mMessages, message.mText, message.mHistory, true);
             }
         }
 
@@ -1437,6 +2266,11 @@ namespace
         set_control_font(state->mFriendsSearch, state->mFont);
         set_control_font(state->mFriendsList, state->mFont);
         set_control_font(state->mPeopleList, state->mFont);
+        set_control_font(state->mLogsSearch, state->mFont);
+        set_control_font(state->mLogsList, state->mFont);
+        set_control_font(state->mLogFind, state->mFont);
+        set_control_font(state->mLogFindButton, state->mFont);
+        set_control_font(state->mLogView, state->mFont);
         for (HWND tab : state->mCommTabs)
         {
             set_control_font(tab, state->mFont);
@@ -1455,7 +2289,7 @@ namespace
         }
 
         const LPARAM edit_margins = MAKELPARAM(8, 8);
-        for (HWND edit : { state->mMessages, state->mInput, state->mNearbyMessages, state->mNearbyInput, state->mFriendsSearch })
+        for (HWND edit : { state->mMessages, state->mInput, state->mNearbyMessages, state->mNearbyInput, state->mFriendsSearch, state->mLogsSearch, state->mLogFind })
         {
             if (edit)
             {
@@ -1464,11 +2298,13 @@ namespace
             }
         }
 
-        for (HWND view : { state->mMessages, state->mNearbyMessages })
+        for (HWND view : { state->mMessages, state->mNearbyMessages, state->mLogView })
         {
             if (view && is_rich_edit(view))
             {
                 SendMessageW(view, EM_SETBKGNDCOLOR, 0, state->mTheme.mField);
+                SendMessageW(view, EM_AUTOURLDETECT, FALSE, 0);
+                SendMessageW(view, EM_SETEVENTMASK, 0, ENM_LINK);
                 HideCaret(view);
             }
         }
@@ -1491,6 +2327,14 @@ namespace
         {
             apply_dark_control_theme(state->mSessions);
         }
+        if (state->mLogsList)
+        {
+            apply_dark_control_theme(state->mLogsList);
+        }
+        if (state->mLogFindButton)
+        {
+            apply_dark_control_theme(state->mLogFindButton);
+        }
     }
 
     bool is_primary_button_id(UINT id)
@@ -1510,6 +2354,7 @@ namespace
         if (id == IDC_COMM_FRIENDS) return state->mActiveCommPanel == 2;
         if (id == IDC_COMM_PEOPLE) return state->mActiveCommPanel == 3;
         if (id == IDC_COMM_ALL) return state->mActiveCommPanel == 4;
+        if (id == IDC_COMM_LOGS) return state->mActiveCommPanel == 5;
         if (id == IDC_PEOPLE_NEARBY) return state->mPeopleActiveTab == 0;
         if (id == IDC_PEOPLE_RECENT) return state->mPeopleActiveTab == 1;
         if (id == IDC_PEOPLE_BLOCKED) return state->mPeopleActiveTab == 2;
@@ -1549,6 +2394,206 @@ namespace
             return static_cast<wchar_t>(std::towlower(ch));
         });
         return value;
+    }
+
+    int base64_value(char ch)
+    {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+        if (ch == '+') return 62;
+        if (ch == '/') return 63;
+        return -1;
+    }
+
+    std::string base64_decode(const std::string& value)
+    {
+        std::string result;
+        int buffer = 0;
+        int bits = -8;
+        for (char ch : value)
+        {
+            if (ch == '=')
+            {
+                break;
+            }
+            const int decoded = base64_value(ch);
+            if (decoded < 0)
+            {
+                continue;
+            }
+            buffer = (buffer << 6) | decoded;
+            bits += 6;
+            if (bits >= 0)
+            {
+                result.push_back(static_cast<char>((buffer >> bits) & 0xff));
+                bits -= 8;
+            }
+        }
+        return result;
+    }
+
+    std::wstring path_file_stem(const std::filesystem::path& path)
+    {
+        std::wstring name = path.stem().wstring();
+        return name.empty() ? path.filename().wstring() : name;
+    }
+
+    std::wstring get_window_text(HWND hwnd)
+    {
+        if (!hwnd)
+        {
+            return std::wstring();
+        }
+
+        const int length = GetWindowTextLengthW(hwnd);
+        std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+        GetWindowTextW(hwnd, text.data(), length + 1);
+        text.resize(static_cast<size_t>(length));
+        return text;
+    }
+
+    std::wstring bytes_to_display_text(const std::string& bytes)
+    {
+        if (bytes.empty())
+        {
+            return std::wstring();
+        }
+
+        const char* data = bytes.data();
+        int size = static_cast<int>(bytes.size());
+        if (size >= 3 &&
+            static_cast<unsigned char>(data[0]) == 0xef &&
+            static_cast<unsigned char>(data[1]) == 0xbb &&
+            static_cast<unsigned char>(data[2]) == 0xbf)
+        {
+            data += 3;
+            size -= 3;
+        }
+
+        int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, size, nullptr, 0);
+        UINT code_page = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        if (required <= 0)
+        {
+            code_page = CP_ACP;
+            flags = 0;
+            required = MultiByteToWideChar(code_page, flags, data, size, nullptr, 0);
+        }
+        if (required <= 0)
+        {
+            return std::wstring();
+        }
+
+        std::wstring result(static_cast<size_t>(required), L'\0');
+        MultiByteToWideChar(code_page, flags, data, size, result.data(), required);
+        return result;
+    }
+
+    void refresh_log_list(WindowState* state)
+    {
+        if (!state || !state->mLogsList)
+        {
+            return;
+        }
+
+        const std::wstring filter = lower_text(get_window_text(state->mLogsSearch));
+        SendMessageW(state->mLogsList, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(state->mLogsList, LB_RESETCONTENT, 0, 0);
+        state->mRenderedLogIndexes.clear();
+
+        for (size_t index = 0; index < state->mLogEntries.size(); ++index)
+        {
+            const std::wstring lowered_name = lower_text(state->mLogEntries[index].mName);
+            if (!filter.empty() && lowered_name.find(filter) == std::wstring::npos)
+            {
+                continue;
+            }
+
+            SendMessageW(state->mLogsList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(state->mLogEntries[index].mName.c_str()));
+            state->mRenderedLogIndexes.push_back(index);
+        }
+
+        if (!state->mRenderedLogIndexes.empty())
+        {
+            SendMessageW(state->mLogsList, LB_SETCURSEL, 0, 0);
+        }
+        SendMessageW(state->mLogsList, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(state->mLogsList, nullptr, TRUE);
+    }
+
+    void enumerate_logs(WindowState* state)
+    {
+        if (!state)
+        {
+            return;
+        }
+
+        state->mLogEntries.clear();
+        if (state->mLogRoot.empty())
+        {
+            refresh_log_list(state);
+            return;
+        }
+
+        std::error_code error;
+        const std::filesystem::path root(state->mLogRoot);
+        if (!std::filesystem::exists(root, error) || !std::filesystem::is_directory(root, error))
+        {
+            refresh_log_list(state);
+            return;
+        }
+
+        for (const auto& entry : std::filesystem::directory_iterator(root, error))
+        {
+            if (error)
+            {
+                break;
+            }
+            if (!entry.is_regular_file(error) || lower_text(entry.path().extension().wstring()) != L".txt")
+            {
+                continue;
+            }
+            state->mLogEntries.push_back({ path_file_stem(entry.path()), entry.path().wstring() });
+        }
+
+        std::stable_sort(state->mLogEntries.begin(), state->mLogEntries.end(), [](const LogEntry& left, const LogEntry& right)
+        {
+            return lower_text(left.mName) < lower_text(right.mName);
+        });
+        refresh_log_list(state);
+    }
+
+    std::wstring session_list_display_name(const std::wstring& name)
+    {
+        if (name.size() > 3 && name.back() == L')')
+        {
+            const size_t open = name.rfind(L" (");
+            if (open != std::wstring::npos && open + 2 < name.size() - 1)
+            {
+                return name.substr(0, open);
+            }
+        }
+        return name;
+    }
+
+    std::wstring transcript_speaker_name(WindowState* state, const std::wstring& session_id, const std::wstring& speaker)
+    {
+        if (!state || lower_text(speaker) == L"second life")
+        {
+            return speaker;
+        }
+
+        const LRESULT count = SendMessageW(state->mSessions, LB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index)
+        {
+            auto session = reinterpret_cast<SessionInfo*>(SendMessageW(state->mSessions, LB_GETITEMDATA, index, 0));
+            if (session && session->mSessionId == session_id && session_list_display_name(session->mName) == speaker)
+            {
+                return session->mName;
+            }
+        }
+        return speaker;
     }
 
     double parse_sort_number(const std::wstring& value)
@@ -1608,6 +2653,44 @@ namespace
             return 1;
         }
         return 0;
+    }
+
+    int compare_friend_rows(const std::wstring& left, const std::wstring& right, int column)
+    {
+        const std::vector<std::wstring> left_columns = split_tab_columns(left);
+        const std::vector<std::wstring> right_columns = split_tab_columns(right);
+
+        if (column == 1)
+        {
+            const std::wstring left_status = left_columns.size() > 1 ? lower_text(left_columns[1]) : L"";
+            const std::wstring right_status = right_columns.size() > 1 ? lower_text(right_columns[1]) : L"";
+            const bool left_online = left_status == L"online";
+            const bool right_online = right_status == L"online";
+            if (left_online != right_online)
+            {
+                return left_online ? -1 : 1;
+            }
+
+            const std::wstring left_name = left_columns.empty() ? L"" : lower_text(left_columns[0]);
+            const std::wstring right_name = right_columns.empty() ? L"" : lower_text(right_columns[0]);
+            const int name_compare = left_name.compare(right_name);
+            if (name_compare < 0)
+            {
+                return -1;
+            }
+            if (name_compare > 0)
+            {
+                return 1;
+            }
+            return 0;
+        }
+
+        int result = compare_table_rows(left, right, column, false);
+        if (result != 0)
+        {
+            return result;
+        }
+        return compare_table_rows(left, right, 0, false);
     }
 
     std::wstring table_header_text(const wchar_t* const* labels, int count, int sort_column, bool ascending)
@@ -1736,6 +2819,7 @@ namespace
         }
         if (parent && GetClientRect(parent, &rect))
         {
+            InvalidateRect(parent, nullptr, TRUE);
             PostMessageW(parent, WM_SIZE, 0, MAKELPARAM(rect.right - rect.left, rect.bottom - rect.top));
         }
 
@@ -1747,6 +2831,9 @@ namespace
                 break;
             case 3:
                 refresh_people_list(state);
+                break;
+            case 5:
+                enumerate_logs(state);
                 break;
             case 4:
                 break;
@@ -1777,6 +2864,11 @@ namespace
         if (parts[0] == "READY" && parts.size() > 1)
         {
             SetWindowTextW(state->mStatus, utf8_to_wide(parts[1]).c_str());
+        }
+        else if (parts[0] == "LOG_ROOT" && parts.size() >= 2)
+        {
+            state->mLogRoot = utf8_to_wide(base64_decode(parts[1]));
+            enumerate_logs(state);
         }
         else if (parts[0] == "PEOPLE_CLEAR" && parts.size() >= 2)
         {
@@ -1910,7 +3002,7 @@ namespace
                             state->mSessions,
                             LB_INSERTSTRING,
                             index,
-                            reinterpret_cast<LPARAM>(existing->mName.c_str()));
+                            reinterpret_cast<LPARAM>(session_list_display_name(existing->mName).c_str()));
                         SendMessageW(state->mSessions, LB_SETITEMDATA, new_index, reinterpret_cast<LPARAM>(existing));
                     }
                     if (reopening_pending_session)
@@ -1937,7 +3029,7 @@ namespace
                 state->mSessions,
                 LB_ADDSTRING,
                 0,
-                reinterpret_cast<LPARAM>(session->mName.c_str()));
+                reinterpret_cast<LPARAM>(session_list_display_name(session->mName).c_str()));
             SendMessageW(state->mSessions, LB_SETITEMDATA, index, reinterpret_cast<LPARAM>(session));
 
             if (SendMessageW(state->mSessions, LB_GETCURSEL, 0, 0) == LB_ERR)
@@ -1984,7 +3076,7 @@ namespace
             }
 
             const std::wstring session_id = utf8_to_wide(parts[1]);
-            std::wstring display = utf8_to_wide(parts[2]);
+            std::wstring display = transcript_speaker_name(state, session_id, utf8_to_wide(parts[2]));
             display += L": ";
             display += utf8_to_wide(parts[4]);
 
@@ -2029,6 +3121,7 @@ namespace
             std::wstring display = utf8_to_wide(parts[2]);
             display += L": ";
             display += utf8_to_wide(parts[4]);
+            const bool online_status_notice = is_online_status_notice(utf8_to_wide(parts[2]), utf8_to_wide(parts[4]));
             const std::wstring key = make_message_key(parts);
             if (!remember_message_key(state, session_id, key))
             {
@@ -2043,7 +3136,7 @@ namespace
             {
                 append_text_line(state->mMessages, display);
             }
-            else
+            else if (!online_status_notice)
             {
                 set_session_unread(state, session_id, true);
             }
@@ -2266,7 +3359,7 @@ namespace
             const int panel_top = margin + tab_height + 12;
             const int panel_height = height - panel_top - input_height - (margin * 3);
 
-            for (int tab = 0; tab < 5; ++tab)
+            for (int tab = 0; tab < 6; ++tab)
             {
                 MoveWindow(state->mCommTabs[tab], margin + (tab * (tab_width + 4)), margin, tab_width, tab_height, TRUE);
             }
@@ -2277,6 +3370,7 @@ namespace
             const bool show_friends = state->mActiveCommPanel == 2;
             const bool show_people = state->mActiveCommPanel == 3;
             const bool show_all = state->mActiveCommPanel == 4;
+            const bool show_logs = state->mActiveCommPanel == 5;
 
             show_control(state->mSessions, show_ims || show_all);
             show_control(state->mMessages, show_ims || show_all);
@@ -2294,6 +3388,11 @@ namespace
                 show_control(state->mPeopleTabs[tab], show_people || show_all);
             }
             show_control(state->mPeopleList, show_people || show_all);
+            show_control(state->mLogsSearch, show_logs);
+            show_control(state->mLogsList, show_logs);
+            show_control(state->mLogFind, show_logs);
+            show_control(state->mLogFindButton, show_logs);
+            show_control(state->mLogView, show_logs);
 
             if (show_all)
             {
@@ -2367,6 +3466,14 @@ namespace
                 MoveWindow(state->mPeopleTabs[tab], margin + (tab * (people_tab_width + 4)), panel_top, people_tab_width, people_tab_height, TRUE);
             }
             MoveWindow(state->mPeopleList, margin, panel_top + people_tab_height + 6, width - margin * 2, height - panel_top - people_tab_height - margin - 6, TRUE);
+
+            const int logs_left_width = 260;
+            const int logs_find_width = 260;
+            MoveWindow(state->mLogsSearch, margin, panel_top, logs_left_width, people_tab_height, TRUE);
+            MoveWindow(state->mLogsList, margin, panel_top + people_tab_height + 6, logs_left_width, height - panel_top - people_tab_height - margin - 6, TRUE);
+            MoveWindow(state->mLogFind, margin + logs_left_width + 10, panel_top, logs_find_width, people_tab_height, TRUE);
+            MoveWindow(state->mLogFindButton, margin + logs_left_width + logs_find_width + 18, panel_top, send_width, people_tab_height, TRUE);
+            MoveWindow(state->mLogView, margin + logs_left_width + 10, panel_top + people_tab_height + 6, width - logs_left_width - margin * 2 - 10, height - panel_top - people_tab_height - margin - 6, TRUE);
             return;
         }
 
@@ -2419,6 +3526,119 @@ namespace
         line += wide_to_utf8(message);
         async_write_pipe_line(state->mPipe, line);
         SetWindowTextW(input, L"");
+    }
+
+    void load_log_entry(WindowState* state, const LogEntry& entry)
+    {
+        if (!state || !state->mLogView)
+        {
+            return;
+        }
+
+        std::ifstream file(std::filesystem::path(entry.mPath), std::ios::binary);
+        if (!file.is_open())
+        {
+            std::wstring message = L"Unable to open log file:\r\n";
+            message += entry.mPath;
+            SetWindowTextW(state->mLogView, message.c_str());
+            apply_rich_text_color(state->mLogView, state->mTheme.mText);
+            return;
+        }
+
+        std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        std::wstring text = bytes_to_display_text(bytes);
+        SendMessageW(state->mLogView, EM_SETREADONLY, FALSE, 0);
+        SetWindowTextW(state->mLogView, text.c_str());
+        apply_rich_text_color(state->mLogView, state->mTheme.mText);
+        SendMessageW(state->mLogView, EM_SETSEL, 0, 0);
+        SendMessageW(state->mLogView, EM_SCROLLCARET, 0, 0);
+        SendMessageW(state->mLogView, EM_SETREADONLY, TRUE, 0);
+        HideCaret(state->mLogView);
+        state->mLoadedLogPath = entry.mPath;
+        state->mLogFindStart = 0;
+    }
+
+    void load_log_at_rendered_index(WindowState* state, LRESULT rendered_index)
+    {
+        if (!state || rendered_index == LB_ERR || rendered_index < 0)
+        {
+            return;
+        }
+
+        const size_t rendered = static_cast<size_t>(rendered_index);
+        if (rendered >= state->mRenderedLogIndexes.size())
+        {
+            return;
+        }
+        const size_t entry_index = state->mRenderedLogIndexes[rendered];
+        if (entry_index >= state->mLogEntries.size())
+        {
+            return;
+        }
+
+        load_log_entry(state, state->mLogEntries[entry_index]);
+    }
+
+    void load_selected_log(WindowState* state)
+    {
+        if (!state || !state->mLogsList)
+        {
+            return;
+        }
+        load_log_at_rendered_index(state, SendMessageW(state->mLogsList, LB_GETCURSEL, 0, 0));
+    }
+
+    void load_first_matching_log(WindowState* state)
+    {
+        if (!state || !state->mLogsList)
+        {
+            return;
+        }
+
+        LRESULT selected = SendMessageW(state->mLogsList, LB_GETCURSEL, 0, 0);
+        if (selected == LB_ERR && !state->mRenderedLogIndexes.empty())
+        {
+            selected = 0;
+            SendMessageW(state->mLogsList, LB_SETCURSEL, 0, 0);
+        }
+        load_log_at_rendered_index(state, selected);
+    }
+
+    void find_next_in_loaded_log(WindowState* state)
+    {
+        if (!state || !state->mLogView || !state->mLogFind)
+        {
+            return;
+        }
+
+        const std::wstring query = get_window_text(state->mLogFind);
+        if (query.empty())
+        {
+            return;
+        }
+
+        const LONG text_length = GetWindowTextLengthW(state->mLogView);
+        FINDTEXTEXW find = {};
+        find.chrg.cpMin = std::min<LONG>(state->mLogFindStart, text_length);
+        find.chrg.cpMax = text_length;
+        find.lpstrText = const_cast<wchar_t*>(query.c_str());
+
+        LRESULT found = SendMessageW(state->mLogView, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&find));
+        if (found == -1 && state->mLogFindStart > 0)
+        {
+            find.chrg.cpMin = 0;
+            find.chrg.cpMax = text_length;
+            found = SendMessageW(state->mLogView, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&find));
+        }
+        if (found == -1)
+        {
+            return;
+        }
+
+        SendMessageW(state->mLogView, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&find.chrgText));
+        SendMessageW(state->mLogView, EM_SCROLLCARET, 0, 0);
+        state->mLogFindStart = find.chrgText.cpMax;
+        HideCaret(state->mLogView);
     }
 
     void send_current_message(WindowState* state)
@@ -2496,6 +3716,23 @@ namespace
         }
     }
 
+    std::wstring get_person_id_at_list_index(WindowState* state, LRESULT list_index)
+    {
+        if (!state || list_index <= 0)
+        {
+            return std::wstring();
+        }
+
+        const size_t person_index = static_cast<size_t>(list_index - 1);
+        const auto& ids = state->mRenderedPeopleIds[state->mPeopleActiveTab];
+        if (person_index >= ids.size() || ids[person_index].empty())
+        {
+            return std::wstring();
+        }
+
+        return ids[person_index];
+    }
+
     std::wstring get_selected_person_id(WindowState* state)
     {
         if (!state || !state->mPeopleList)
@@ -2509,24 +3746,16 @@ namespace
             return std::wstring();
         }
 
-        const size_t person_index = static_cast<size_t>(selected - 1);
-        const auto& ids = state->mRenderedPeopleIds[state->mPeopleActiveTab];
-        if (person_index >= ids.size() || ids[person_index].empty())
-        {
-            return std::wstring();
-        }
-
-        return ids[person_index];
+        return get_person_id_at_list_index(state, selected);
     }
 
-    void open_selected_person_im(WindowState* state)
+    void open_person_im(WindowState* state, const std::wstring& person_id)
     {
         if (!state || state->mPipe == INVALID_HANDLE_VALUE)
         {
             return;
         }
 
-        const std::wstring person_id = get_selected_person_id(state);
         if (person_id.empty())
         {
             return;
@@ -2542,22 +3771,97 @@ namespace
         }
     }
 
-    void zoom_selected_person(WindowState* state)
+    void open_selected_person_im(WindowState* state)
     {
-        if (!state || state->mPipe == INVALID_HANDLE_VALUE)
+        open_person_im(state, get_selected_person_id(state));
+    }
+
+    std::string sanitize_companion_command_field(std::string value)
+    {
+        std::replace(value.begin(), value.end(), '|', ' ');
+        std::replace(value.begin(), value.end(), '\r', ' ');
+        std::replace(value.begin(), value.end(), '\n', ' ');
+        return value;
+    }
+
+    bool is_second_life_action_link(const std::wstring& link)
+    {
+        const std::wstring lowered = lower_text(link);
+        return lowered.rfind(L"secondlife:///", 0) == 0 ||
+            lowered.rfind(L"http://maps.secondlife.com/", 0) == 0 ||
+            lowered.rfind(L"https://maps.secondlife.com/", 0) == 0;
+    }
+
+    void open_link_in_viewer(WindowState* state, const std::wstring& link)
+    {
+        if (!state || state->mPipe == INVALID_HANDLE_VALUE || link.empty())
         {
             return;
         }
 
-        const std::wstring person_id = get_selected_person_id(state);
-        if (person_id.empty())
-        {
-            return;
-        }
-
-        std::string line = "ZOOM_AVATAR|";
-        line += wide_to_utf8(person_id);
+        std::string line = "OPEN_SLURL|";
+        line += sanitize_companion_command_field(wide_to_utf8(link));
         async_write_pipe_line(state->mPipe, line);
+    }
+
+    void open_companion_link(WindowState* state, const std::wstring& link)
+    {
+        if (link.empty())
+        {
+            return;
+        }
+
+        if (is_second_life_action_link(link))
+        {
+            open_link_in_viewer(state, link);
+            return;
+        }
+
+        ShellExecuteW(nullptr, L"open", link.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    std::wstring get_rich_text_range(HWND edit, CHARRANGE range)
+    {
+        if (!edit || range.cpMin < 0 || range.cpMax <= range.cpMin)
+        {
+            return std::wstring();
+        }
+
+        std::wstring text;
+        text.resize(static_cast<size_t>(range.cpMax - range.cpMin) + 1);
+        TEXTRANGEW text_range = {};
+        text_range.chrg = range;
+        text_range.lpstrText = text.data();
+        const LRESULT copied = SendMessageW(edit, EM_GETTEXTRANGE, 0, reinterpret_cast<LPARAM>(&text_range));
+        if (copied <= 0)
+        {
+            return std::wstring();
+        }
+        text.resize(static_cast<size_t>(copied));
+        return text;
+    }
+
+    std::wstring get_rich_link_target(WindowState* state, HWND edit, CHARRANGE range)
+    {
+        if (!state || !edit)
+        {
+            return std::wstring();
+        }
+
+        const auto found = state->mRichLinks.find(edit);
+        if (found == state->mRichLinks.end())
+        {
+            return std::wstring();
+        }
+
+        for (const RichLinkRange& link : found->second)
+        {
+            if (range.cpMin >= link.mStart && range.cpMax <= link.mEnd)
+            {
+                return link.mTarget;
+            }
+        }
+        return std::wstring();
     }
 
     void close_selected_session(WindowState* state)
@@ -2592,6 +3896,8 @@ namespace
             const LRESULT next_index = selected < count ? selected : count - 1;
             SendMessageW(state->mSessions, LB_SETCURSEL, next_index, 0);
         }
+        state->mRichLinks[state->mMessages].clear();
+        state->mHoveredRichLinkStart[state->mMessages] = -1;
         SetWindowTextW(state->mMessages, L"");
         refresh_conversation_messages(state);
     }
@@ -2618,51 +3924,6 @@ namespace
 
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, IDM_SESSION_CLOSE, L"Close IM");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screen_point.x, screen_point.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
-    }
-
-    void show_people_context_menu(HWND hwnd, WindowState* state, int x, int y)
-    {
-        if (!state || !state->mPeopleList || !is_people_target(state))
-        {
-            return;
-        }
-
-        POINT screen_point = { x, y };
-        if (x == -1 && y == -1)
-        {
-            const LRESULT selected = SendMessageW(state->mPeopleList, LB_GETCURSEL, 0, 0);
-            if (selected == LB_ERR || selected <= 0)
-            {
-                return;
-            }
-            RECT item_rect = {};
-            SendMessageW(state->mPeopleList, LB_GETITEMRECT, selected, reinterpret_cast<LPARAM>(&item_rect));
-            screen_point = { item_rect.left + 8, item_rect.top + 8 };
-            ClientToScreen(state->mPeopleList, &screen_point);
-        }
-        else
-        {
-            POINT client_point = screen_point;
-            ScreenToClient(state->mPeopleList, &client_point);
-            const LRESULT hit = SendMessageW(state->mPeopleList, LB_ITEMFROMPOINT, 0, MAKELPARAM(client_point.x, client_point.y));
-            if (HIWORD(hit))
-            {
-                return;
-            }
-
-            const int index = LOWORD(hit);
-            if (index <= 0)
-            {
-                return;
-            }
-            SendMessageW(state->mPeopleList, LB_SETCURSEL, index, 0);
-        }
-
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, IDM_PERSON_IM, L"IM");
-        AppendMenuW(menu, MF_STRING, IDM_PERSON_ZOOM, L"Zoom In");
         TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN, screen_point.x, screen_point.y, 0, hwnd, nullptr);
         DestroyMenu(menu);
     }
@@ -2915,6 +4176,10 @@ namespace
                     HFONT previous_font = reinterpret_cast<HFONT>(SelectObject(draw->hDC, state && state->mFont ? state->mFont : GetStockObject(DEFAULT_GUI_FONT)));
                     if (!draw_table_row(draw, text_buffer))
                     {
+                        if (draw->CtlID == IDC_SESSIONS && typing_session)
+                        {
+                            wcscat_s(text_buffer, L"...");
+                        }
                         RECT text_rect = { draw->rcItem.left + 7, draw->rcItem.top + 1, draw->rcItem.right - 4, draw->rcItem.bottom };
                         DrawTextW(draw->hDC, text_buffer, -1, &text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                     }
@@ -3028,6 +4293,27 @@ namespace
                 }
                 break;
             }
+            case WM_NOTIFY:
+            {
+                auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+                auto notify = reinterpret_cast<NMHDR*>(lparam);
+                if (state && notify && notify->code == EN_LINK &&
+                    (notify->hwndFrom == state->mMessages || notify->hwndFrom == state->mNearbyMessages))
+                {
+                    auto link = reinterpret_cast<ENLINK*>(lparam);
+                    if (link->msg == WM_LBUTTONUP)
+                    {
+                        std::wstring target = get_rich_link_target(state, notify->hwndFrom, link->chrg);
+                        if (target.empty())
+                        {
+                            target = get_rich_text_range(notify->hwndFrom, link->chrg);
+                        }
+                        open_companion_link(state, target);
+                    }
+                    return 0;
+                }
+                break;
+            }
             case WM_COMMAND:
             {
                 auto state = reinterpret_cast<WindowState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
@@ -3039,34 +4325,6 @@ namespace
                 if (LOWORD(wparam) == IDM_SESSION_CLOSE)
                 {
                     close_selected_session(state);
-                    return 0;
-                }
-                if (LOWORD(wparam) == IDM_PERSON_IM)
-                {
-                    open_selected_person_im(state);
-                    return 0;
-                }
-                if (LOWORD(wparam) == IDM_PERSON_ZOOM)
-                {
-                    zoom_selected_person(state);
-                    return 0;
-                }
-                if ((LOWORD(wparam) == IDC_INPUT || LOWORD(wparam) == IDC_NEARBY_INPUT) && HIWORD(wparam) == EN_UPDATE)
-                {
-                    HWND input = reinterpret_cast<HWND>(lparam);
-                    wchar_t text[2048] = {};
-                    GetWindowTextW(input, text, 2048);
-                    std::wstring value(text);
-                    if (!value.empty() && value.back() == L'\n')
-                    {
-                        while (!value.empty() && (value.back() == L'\r' || value.back() == L'\n'))
-                        {
-                            value.pop_back();
-                        }
-                        SetWindowTextW(input, value.c_str());
-                        SendMessageW(input, EM_SETSEL, value.size(), value.size());
-                        send_from_focused_input(hwnd);
-                    }
                     return 0;
                 }
                 if (LOWORD(wparam) == IDC_FRIENDS_SEARCH && HIWORD(wparam) == EN_CHANGE)
@@ -3107,6 +4365,26 @@ namespace
                 if (LOWORD(wparam) == IDC_COMM_ALL && HIWORD(wparam) == BN_CLICKED)
                 {
                     set_communications_panel(state, 4);
+                    return 0;
+                }
+                if (LOWORD(wparam) == IDC_COMM_LOGS && HIWORD(wparam) == BN_CLICKED)
+                {
+                    set_communications_panel(state, 5);
+                    return 0;
+                }
+                if (LOWORD(wparam) == IDC_LOGS_SEARCH && HIWORD(wparam) == EN_CHANGE)
+                {
+                    refresh_log_list(state);
+                    return 0;
+                }
+                if (LOWORD(wparam) == IDC_LOGS_LIST && HIWORD(wparam) == LBN_SELCHANGE)
+                {
+                    load_selected_log(state);
+                    return 0;
+                }
+                if (LOWORD(wparam) == IDC_LOG_FIND_BUTTON && HIWORD(wparam) == BN_CLICKED)
+                {
+                    find_next_in_loaded_log(state);
                     return 0;
                 }
                 if (LOWORD(wparam) == IDC_SESSIONS && HIWORD(wparam) == LBN_SELCHANGE)
@@ -3156,6 +4434,7 @@ namespace
                 }
                 if (LOWORD(wparam) == IDC_PEOPLE_LIST && HIWORD(wparam) == LBN_DBLCLK)
                 {
+                    open_selected_person_im(state);
                     return 0;
                 }
                 if (LOWORD(wparam) == IDC_FRIENDS_LIST && HIWORD(wparam) == LBN_DBLCLK)
@@ -3187,11 +4466,6 @@ namespace
                 if (state && source == state->mSessions)
                 {
                     show_session_context_menu(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
-                    return 0;
-                }
-                if (state && source == state->mPeopleList)
-                {
-                    show_people_context_menu(hwnd, state, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
                     return 0;
                 }
                 if (source == hwnd)
@@ -3426,6 +4700,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
         state->mCommTabs[2] = CreateWindowEx(0, L"BUTTON", L"Nearby", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_COMM_NEARBY), instance, nullptr);
         state->mCommTabs[3] = CreateWindowEx(0, L"BUTTON", L"Friends", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_COMM_FRIENDS), instance, nullptr);
         state->mCommTabs[4] = CreateWindowEx(0, L"BUTTON", L"People", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_COMM_PEOPLE), instance, nullptr);
+        state->mCommTabs[5] = CreateWindowEx(0, L"BUTTON", L"Logs", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_COMM_LOGS), instance, nullptr);
 
         state->mSessions = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", L"", LISTBOX_NOTIFY_STYLE, 0, 0, 0, 0, hwnd, control_id(IDC_SESSIONS), instance, nullptr);
         state->mMessages = CreateWindowEx(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", MESSAGE_VIEW_STYLE, 0, 0, 0, 0, hwnd, control_id(IDC_MESSAGES), instance, nullptr);
@@ -3443,6 +4718,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
         state->mPeopleTabs[1] = CreateWindowEx(0, L"BUTTON", L"Recent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_PEOPLE_RECENT), instance, nullptr);
         state->mPeopleTabs[2] = CreateWindowEx(0, L"BUTTON", L"Blocked", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_PEOPLE_BLOCKED), instance, nullptr);
         state->mPeopleList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", L"", LISTBOX_TABS_NOTIFY_STYLE, 0, 0, 0, 0, hwnd, control_id(IDC_PEOPLE_LIST), instance, nullptr);
+        state->mLogsSearch = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, control_id(IDC_LOGS_SEARCH), instance, nullptr);
+        state->mLogsList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", L"", LISTBOX_NOTIFY_STYLE, 0, 0, 0, 0, hwnd, control_id(IDC_LOGS_LIST), instance, nullptr);
+        state->mLogFind = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd, control_id(IDC_LOG_FIND), instance, nullptr);
+        state->mLogFindButton = CreateWindowEx(0, L"BUTTON", L"Find", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, control_id(IDC_LOG_FIND_BUTTON), instance, nullptr);
+        state->mLogView = CreateWindowEx(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", MESSAGE_VIEW_STYLE, 0, 0, 0, 0, hwnd, control_id(IDC_LOG_VIEW), instance, nullptr);
         refresh_people_list(state);
     }
     else if (target == L"people")
@@ -3472,9 +4752,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command)
     apply_control_details(state);
     subclass_message_view(state, state->mMessages, &WindowState::mMessagesProc);
     subclass_message_view(state, state->mNearbyMessages, &WindowState::mNearbyMessagesProc);
+    subclass_message_view(state, state->mLogView, &WindowState::mLogViewProc);
     subclass_input_edit(state, state->mInput, &WindowState::mInputProc);
     subclass_input_edit(state, state->mNearbyInput, &WindowState::mNearbyInputProc);
     subclass_input_edit(state, state->mFriendsSearch, &WindowState::mFriendsSearchProc);
+    subclass_input_edit(state, state->mLogsSearch, &WindowState::mLogsSearchProc);
+    subclass_input_edit(state, state->mLogFind, &WindowState::mLogFindProc);
+    subclass_people_list(state);
 
     if (!pipe_name.empty())
     {
